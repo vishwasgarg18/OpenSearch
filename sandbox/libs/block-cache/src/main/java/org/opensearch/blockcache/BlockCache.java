@@ -8,8 +8,10 @@
 
 package org.opensearch.blockcache;
 
-import java.io.Closeable;
+import org.opensearch.blockcache.stats.AggregateBlockCacheStats;
+import org.opensearch.blockcache.stats.BlockCacheStats;
 
+import java.io.Closeable;
 
 /**
  * A node-level cache for variable-size blocks of data read from remote storage.
@@ -29,6 +31,17 @@ import java.io.Closeable;
  * @opensearch.experimental
  */
 public interface BlockCache extends Closeable {
+
+    /**
+     * Snapshots the current cache statistics.
+     *
+     * <p>Implementations that do not track statistics return all-zero stats.
+     *
+     * @return a point-in-time stats snapshot; never {@code null}
+     */
+    default AggregateBlockCacheStats cacheStats() {
+        return AggregateBlockCacheStats.EMPTY;
+    }
 
     /**
      * Release all resources held by this cache.

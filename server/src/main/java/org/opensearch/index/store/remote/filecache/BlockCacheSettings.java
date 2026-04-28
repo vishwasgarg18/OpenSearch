@@ -80,5 +80,25 @@ public final class BlockCacheSettings {
         return value;
     }, Setting.Property.NodeScope);
 
+    /**
+     * Disk capacity allocated to the Foyer column (format) cache on the warm node SSD.
+     *
+     * <p>Default: {@code 0b} (disabled — all SSD goes to FileCache).
+     * When set to a positive value, {@link UnifiedCacheService} carves out this many bytes from
+     * the total SSD before computing the FileCache allocation. The combined allocation is
+     * validated against available SSD at startup; the node refuses to start if the sum exceeds
+     * available capacity.
+     *
+     * <p>Configure in {@code opensearch.yml}:
+     * <pre>{@code
+     * format_cache.disk_bytes: 200gb
+     * }</pre>
+     */
+    public static final Setting<ByteSizeValue> DISK_BYTES_SETTING = Setting.byteSizeSetting(
+        "format_cache.disk_bytes",
+        ByteSizeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
     private BlockCacheSettings() {}
 }

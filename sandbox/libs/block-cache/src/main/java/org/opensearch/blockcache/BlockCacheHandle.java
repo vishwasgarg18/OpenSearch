@@ -10,6 +10,8 @@ package org.opensearch.blockcache;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.index.store.remote.filecache.CacheStatsProvider;
+import org.opensearch.index.store.remote.filecache.NodeCacheStats;
 
 import java.io.Closeable;
 import java.util.Objects;
@@ -22,23 +24,16 @@ import java.util.Objects;
  * {@code BlockCacheHandle} rather than the raw {@link BlockCache} interface,
  * which avoids ambiguity when multiple {@link BlockCache} bindings exist.
  *
- * <p>The concrete {@link BlockCache} implementation is injected at construction
- * time, keeping this class entirely decoupled from any specific backend:
+ * <p>Implements {@link CacheStatsProvider} by delegating to
+ * {@link BlockCache#cacheStats()}. Each {@link BlockCache} implementation is
+ * responsible for its own stats collection; this handle is purely a lifecycle
+ * and injection boundary.
  *
- * <pre>{@code
- * // Foyer-backed (native):
- * BlockCacheHandle handle = new BlockCacheHandle(new FoyerBlockCache(diskBytes, diskDir));
- *
- * // No-op (tests / cache disabled):
- * BlockCacheHandle handle = new BlockCacheHandle(new NoOpBlockCache());
- * }</pre>
- *
- * <p>Thread-safe. The {@link BlockCache} reference is {@code final}; per JLS §17.5,
- * {@code final} fields have safe-publication semantics.
+ * <p>Thread-safe. The {@link BlockCache} reference is {@code final}.
  *
  * @opensearch.experimental
  */
-public final class BlockCacheHandle implements Closeable {
+public final class BlockCacheHandle implements Closeable, CacheStatsProvider {
 
     private static final Logger logger = LogManager.getLogger(BlockCacheHandle.class);
 
@@ -48,7 +43,6 @@ public final class BlockCacheHandle implements Closeable {
      * Creates a {@code BlockCacheHandle} wrapping the given {@link BlockCache}.
      *
      * @param cache the {@link BlockCache} implementation to manage; must not be null
-     * @throws NullPointerException if {@code cache} is null
      */
     public BlockCacheHandle(BlockCache cache) {
         this.cache = Objects.requireNonNull(cache, "cache must not be null");
@@ -56,26 +50,22 @@ public final class BlockCacheHandle implements Closeable {
 
     /**
      * Returns the {@link BlockCache} managed by this handle.
-     *
-     * <p>Callers that need to hand the cache to a native layer should
-     * pattern-match against the concrete implementation:
-     * <pre>{@code
-     * BlockCache bc = handle.getCache();
-     * if (bc instanceof FoyerBlockCache foyer) {
-     *     nativeRuntime.attachCache(foyer.nativeCachePtr());
-     * }
-     * }</pre>
-     *
-     * @return the {@link BlockCache} instance; never {@code null}
      */
     public BlockCache getCache() {
         return cache;
     }
 
     /**
-     * Closes the underlying cache. Delegates to {@link BlockCache#close()}.
-     *
-     * <p>Idempotency is enforced by the {@link BlockCache} implementation.
+     * Returns a live snapshot of this cache's statistics.
+     * Delegates to {@link BlockCache#cacheStats()}.
+     */
+    @Override
+    public NodeCacheStats cacheStats() {
+        return cache.cacheStats();
+    }
+
+    /**
+     * Closes the underlying cache. Idempotency is enforced by {@link BlockCache#close()}.
      */
     @Override
     public void close() {

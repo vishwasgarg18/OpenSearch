@@ -11,6 +11,8 @@ package org.opensearch.blockcache.foyer;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.blockcache.BlockCache;
+import org.opensearch.blockcache.stats.AggregateBlockCacheStats;
+import org.opensearch.blockcache.stats.BlockCacheStats;
 
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -31,6 +33,9 @@ public final class FoyerBlockCache implements BlockCache {
 
     /** Opaque native handle returned by {@code foyer_create_cache}. Always positive. */
     private final long cachePtr;
+
+    /** The configured disk capacity in bytes */
+    private final long diskBytes;
 
     /** Guards against double-close per the {@link AutoCloseable} contract. */
     private final AtomicBoolean closed = new AtomicBoolean(false);
@@ -61,21 +66,43 @@ public final class FoyerBlockCache implements BlockCache {
             throw new IllegalArgumentException("blockSizeBytes must be > 0, got: " + blockSizeBytes);
         }
         Objects.requireNonNull(ioEngine, "ioEngine must not be null");
+        this.diskBytes = diskBytes;
         this.cachePtr = FoyerBridge.createCache(diskBytes, diskDir, blockSizeBytes, ioEngine);
     }
 
     /**
-     * Returns the opaque native cache pointer.
+     * Returns the configured disk capacity in bytes.
      *
-     * <p><strong>Native-aware callers only.</strong> This method lives outside the
-     * {@link BlockCache} interface to prevent leakage of the native handle into
-     * general-purpose code. Callers must first verify the runtime type with
-     * {@code instanceof FoyerBlockCache} before calling this method.
+     * @return the disk capacity in bytes; always {@code > 0}
+     */
+    public long diskCapacityBytes() {
+        return diskBytes;
+    }
+
+    /**
+     * Returns the opaque handle to the underlying native cache instance.
      *
-     * @return the positive {@code long} handle to the native cache instance
+     * <p>This method is intentionally absent from the {@link BlockCache} interface
+     * to confine native handle access to code that explicitly narrows the type to
+     * {@code FoyerBlockCache}.
+     *
+     * @return the positive {@code long} handle to the native cache
      */
     public long nativeCachePtr() {
         return cachePtr;
+    }
+
+    /**
+     * Snapshots cache statistics by reading Rust atomic counters via FFM call.
+     * Field order is defined by {@link BlockCacheStats.Field}.
+     */
+    @Override
+    public AggregateBlockCacheStats cacheStats() {
+        long[] raw = FoyerBridge.snapshotStats(cachePtr);
+        return new AggregateBlockCacheStats(
+            BlockCacheStats.fromRaw(raw, 0,                           diskBytes), // overall
+            BlockCacheStats.fromRaw(raw, BlockCacheStats.Field.COUNT, diskBytes)  // block-level
+        );
     }
 
     /**
