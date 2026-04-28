@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use native_bridge_common::ffm_safe;
 use crate::foyer::foyer_cache::FoyerCache;
+use crate::stats::AggregateBlockCacheStats;
 
 /// Create a [`FoyerCache`] and return an opaque `Arc` handle as `i64`.
 ///
@@ -68,4 +69,56 @@ pub unsafe extern "C" fn foyer_destroy_cache(ptr: i64) -> i64 {
     }
     drop(Arc::from_raw(ptr as *const FoyerCache));
     Ok(0)
+}
+
+/// Snapshot the aggregate cache statistics into a caller-supplied `i64[14]` output buffer.
+///
+/// Mirrors the [`AggregateBlockCacheStats`] structure for uniformity with
+/// Java's `AggregateRefCountedCacheStats` pattern.
+///
+/// Called by Java's `FoyerBridge.snapshotStats(ptr)` at most once per
+/// `_nodes/stats` request — not on the hot path.
+///
+/// # Output layout (indices 0–13)
+/// Indices 0–6:  **overall** stats (cross-tier rollup; today identical to block_level)
+/// Indices 7–13: **block_level** stats (disk tier)
+///
+/// Each 7-value section has the same sub-layout:
+/// | Offset | Field           | Notes                                             |
+/// |--------|-----------------|---------------------------------------------------|
+/// | +0     | `hit_count`     | `get()` calls that returned a cached value        |
+/// | +1     | `hit_bytes`     | Bytes served from cache across all hits           |
+/// | +2     | `miss_count`    | `get()` calls that returned no value              |
+/// | +3     | `miss_bytes`    | Bytes that required remote fetch (from key range) |
+/// | +4     | `eviction_count`| Entries removed by LRU pressure                  |
+/// | +5     | `eviction_bytes`| Total bytes removed by LRU pressure               |
+/// | +6     | `used_bytes`    | Current bytes resident on disk                    |
+///
+/// # Returns
+/// `0` on success; `< 0` if `ptr` is invalid or `out` is null.
+///
+/// # Safety
+/// - `ptr` must be a value returned by [`foyer_create_cache`] not yet destroyed.
+/// - `out` must point to a writable buffer of at least **14** `i64` values.
+#[no_mangle]
+pub unsafe extern "C" fn foyer_snapshot_stats(ptr: i64, out: *mut i64) -> i64 {
+    if ptr <= 0 || out.is_null() {
+        return -1;
+    }
+    // Borrow the Arc without consuming it.
+    let cache = Arc::from_raw(ptr as *const FoyerCache);
+    let single = cache.stats.snapshot();
+    // Prevent the Arc from being dropped — we don't own it.
+    std::mem::forget(cache);
+
+    // Build the aggregate: today Foyer is single-tier so overall == block_level.
+    let agg = AggregateBlockCacheStats {
+        overall:     single,
+        block_level: single,
+    };
+    let flat = agg.to_flat();
+    for (i, &v) in flat.iter().enumerate() {
+        *out.add(i) = v;
+    }
+    0
 }

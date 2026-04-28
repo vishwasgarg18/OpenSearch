@@ -768,6 +768,8 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 TieringUtils.FILECACHE_ACTIVE_USAGE_TIERING_THRESHOLD_PERCENT,
 
                 // Settings related to block cache
+                // Settings related to format (block) cache
+                BlockCacheSettings.DISK_BYTES_SETTING,
                 BlockCacheSettings.BLOCK_SIZE_SETTING,
                 BlockCacheSettings.IO_ENGINE_SETTING,
 

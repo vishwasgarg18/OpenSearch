@@ -74,8 +74,18 @@ public class FsInfo implements Iterable<FsInfo.Path>, Writeable, ToXContentFragm
         long total = -1;
         long free = -1;
         long available = -1;
-        long fileCacheReserved = -1;
-        long fileCacheUtilized = 0;
+        /**
+         * Total SSD bytes reserved by ALL warm-node caches combined:
+         * FileCache (Lucene block cache) + block cache (Foyer, if configured).
+         * Used by {@code WarmFsService} for correct disk watermark calculations.
+         * -1 = not a warm node / not yet set.
+         */
+        long cacheReservedInBytes = -1;
+        /**
+         * Total bytes currently resident across all warm-node caches combined.
+         * 0 when no data is cached.
+         */
+        long cacheUtilized = 0;
 
         public Path() {}
 
@@ -98,8 +108,8 @@ public class FsInfo implements Iterable<FsInfo.Path>, Writeable, ToXContentFragm
             free = in.readLong();
             available = in.readLong();
             if (in.getVersion().onOrAfter(Version.V_2_7_0)) {
-                fileCacheReserved = in.readLong();
-                fileCacheUtilized = in.readLong();
+                cacheReservedInBytes = in.readLong();
+                cacheUtilized = in.readLong();
             }
         }
 
@@ -112,8 +122,8 @@ public class FsInfo implements Iterable<FsInfo.Path>, Writeable, ToXContentFragm
             out.writeLong(free);
             out.writeLong(available);
             if (out.getVersion().onOrAfter(Version.V_2_7_0)) {
-                out.writeLong(fileCacheReserved);
-                out.writeLong(fileCacheUtilized);
+                out.writeLong(cacheReservedInBytes);
+                out.writeLong(cacheUtilized);
             }
         }
 
@@ -141,12 +151,12 @@ public class FsInfo implements Iterable<FsInfo.Path>, Writeable, ToXContentFragm
             return new ByteSizeValue(available);
         }
 
-        public ByteSizeValue getFileCacheReserved() {
-            return new ByteSizeValue(fileCacheReserved);
+        public ByteSizeValue getCacheReservedInBytes() {
+            return new ByteSizeValue(cacheReservedInBytes);
         }
 
-        public ByteSizeValue getFileCacheUtilized() {
-            return new ByteSizeValue(fileCacheUtilized);
+        public ByteSizeValue getCacheUtilized() {
+            return new ByteSizeValue(cacheUtilized);
         }
 
         private long addLong(long current, long other) {
@@ -165,8 +175,8 @@ public class FsInfo implements Iterable<FsInfo.Path>, Writeable, ToXContentFragm
         public void add(Path path) {
             total = FsProbe.adjustForHugeFilesystems(addLong(total, path.total));
             free = FsProbe.adjustForHugeFilesystems(addLong(free, path.free));
-            fileCacheReserved = FsProbe.adjustForHugeFilesystems(addLong(fileCacheReserved, path.fileCacheReserved));
-            fileCacheUtilized = FsProbe.adjustForHugeFilesystems(addLong(fileCacheUtilized, path.fileCacheUtilized));
+            cacheReservedInBytes = FsProbe.adjustForHugeFilesystems(addLong(cacheReservedInBytes, path.cacheReservedInBytes));
+            cacheUtilized = FsProbe.adjustForHugeFilesystems(addLong(cacheUtilized, path.cacheUtilized));
             available = FsProbe.adjustForHugeFilesystems(addLong(available, path.available));
         }
 
@@ -208,11 +218,11 @@ public class FsInfo implements Iterable<FsInfo.Path>, Writeable, ToXContentFragm
             if (available != -1) {
                 builder.humanReadableField(Fields.AVAILABLE_IN_BYTES, Fields.AVAILABLE, getAvailable());
             }
-            if (fileCacheReserved != -1) {
-                builder.humanReadableField(Fields.CACHE_RESERVED_IN_BYTES, Fields.CACHE_RESERVED, getFileCacheReserved());
+            if (cacheReservedInBytes != -1) {
+                builder.humanReadableField(Fields.CACHE_RESERVED_IN_BYTES, Fields.CACHE_RESERVED, getCacheReservedInBytes());
             }
-            if (fileCacheReserved != 0) {
-                builder.humanReadableField(Fields.CACHE_UTILIZED, Fields.CACHE_UTILIZED_IN_BYTES, getFileCacheUtilized());
+            if (cacheReservedInBytes != 0) {
+                builder.humanReadableField(Fields.CACHE_UTILIZED, Fields.CACHE_UTILIZED_IN_BYTES, getCacheUtilized());
             }
 
             builder.endObject();

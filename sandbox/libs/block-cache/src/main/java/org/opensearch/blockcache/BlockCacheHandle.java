@@ -10,6 +10,12 @@ package org.opensearch.blockcache;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.blockcache.foyer.FoyerBlockCache;
+import org.opensearch.blockcache.stats.AggregateBlockCacheStats;
+import org.opensearch.blockcache.stats.BlockCacheStatsCounter;
+import org.opensearch.blockcache.stats.FoyerBlockCacheStatsCounter;
+import org.opensearch.index.store.remote.filecache.CacheStats;
+import org.opensearch.index.store.remote.filecache.CacheStatsProvider;
 
 import java.io.Closeable;
 import java.util.Objects;
@@ -33,25 +39,55 @@ import java.util.Objects;
  * BlockCacheHandle handle = new BlockCacheHandle(new NoOpBlockCache());
  * }</pre>
  *
- * <p>Thread-safe. The {@link BlockCache} reference is {@code final}; per JLS §17.5,
- * {@code final} fields have safe-publication semantics.
+ * <p>Implements {@link CacheStatsProvider} — the {@link #cacheStats()} method
+ * reads stats via a {@link BlockCacheStatsCounter} whose implementation
+ * ({@link FoyerBlockCacheStatsCounter}) performs an FFM call to read Rust
+ * atomic counters from the native Foyer runtime. This mirrors the Java
+ * {@link org.opensearch.index.store.remote.utils.cache.stats.StatsCounter}
+ * → {@link org.opensearch.index.store.remote.utils.cache.stats.IRefCountedCacheStats}
+ * pattern used by {@code LRUCache}.
+ *
+ * <p>Thread-safe. The {@link BlockCache} and {@link BlockCacheStatsCounter}
+ * references are {@code final}; per JLS §17.5, {@code final} fields have
+ * safe-publication semantics.
  *
  * @opensearch.experimental
  */
-public final class BlockCacheHandle implements Closeable {
+public final class BlockCacheHandle implements Closeable, CacheStatsProvider {
 
     private static final Logger logger = LogManager.getLogger(BlockCacheHandle.class);
 
     private final BlockCache cache;
 
     /**
+     * Stats counter for this cache. Analogous to
+     * {@link org.opensearch.index.store.remote.utils.cache.stats.StatsCounter}
+     * in the {@code LRUCache} pattern. For Foyer-backed caches this is a
+     * {@link FoyerBlockCacheStatsCounter} that reads Rust atomic counters via
+     * FFM. For non-Foyer caches (e.g. tests) this returns
+     * {@link CacheStats#EMPTY}.
+     */
+    private final BlockCacheStatsCounter statsCounter;
+
+    /**
      * Creates a {@code BlockCacheHandle} wrapping the given {@link BlockCache}.
+     *
+     * <p>If {@code cache} is a {@link FoyerBlockCache}, a
+     * {@link FoyerBlockCacheStatsCounter} is wired automatically so that
+     * {@link #cacheStats()} performs real FFM stats reads. For other
+     * implementations, a no-op counter is used.
      *
      * @param cache the {@link BlockCache} implementation to manage; must not be null
      * @throws NullPointerException if {@code cache} is null
      */
     public BlockCacheHandle(BlockCache cache) {
         this.cache = Objects.requireNonNull(cache, "cache must not be null");
+        if (cache instanceof FoyerBlockCache foyer) {
+            this.statsCounter = new FoyerBlockCacheStatsCounter(foyer);
+        } else {
+            // Non-Foyer cache (e.g. test stubs) — return empty aggregate stats
+            this.statsCounter = () -> AggregateBlockCacheStats.EMPTY;
+        }
     }
 
     /**
@@ -70,6 +106,40 @@ public final class BlockCacheHandle implements Closeable {
      */
     public BlockCache getCache() {
         return cache;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Returns a {@link CacheStats} snapshot for this block cache.
+     *
+     * <p>For Foyer-backed caches, delegates to
+     * {@link FoyerBlockCacheStatsCounter#snapshot()} which performs a single
+     * FFM call ({@code foyer_snapshot_stats}) to read five Rust
+     * {@code AtomicI64} counters from the native Foyer runtime. Analogous to
+     * calling {@code DefaultStatsCounter.snapshot()} in the Java
+     * {@link org.opensearch.index.store.remote.filecache.FileCache} pattern.
+     *
+     * <p>Called at most once per {@code _nodes/stats} request by
+     * {@link org.opensearch.index.store.remote.filecache.UnifiedCacheService#aggregateStats()}.
+     *
+     * @return a point-in-time stats snapshot; never {@code null}
+     */
+    @Override
+    public CacheStats cacheStats() {
+        var s = statsCounter.snapshot();
+        // Use overall stats (cross-tier rollup; today == block_level for single-tier Foyer)
+        var overall = s.overallStats();
+        return new CacheStats(
+            overall.hitCount(),
+            overall.hitBytes(),   // bytes served from cache — critical for variable-size entries
+            overall.missCount(),
+            overall.missBytes(),  // bytes fetched remotely — known from key range at miss time
+            overall.usedBytes(),
+            overall.evictionBytes(),
+            0L,                   // removedBytes: lifecycle removes tracked separately (evict_prefix)
+            overall.capacityBytes()
+        );
     }
 
     /**
