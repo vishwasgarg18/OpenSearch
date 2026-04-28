@@ -62,6 +62,32 @@ impl CacheKey {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Returns the number of bytes covered by this cache key.
+    ///
+    /// For range entries (format `"path\x1Fstart-end"`) this is `end - start`,
+    /// which equals the exact number of bytes the caller requested from the
+    /// remote store. Used to track `miss_bytes` in
+    /// [`BlockCacheStats`][crate::stats::BlockCacheStats] — even on a miss we
+    /// know the requested size from the key before any remote fetch.
+    ///
+    /// For non-range keys (no [`SEPARATOR`]) the length cannot be inferred from
+    /// the key alone; returns `0` so callers can safely call this on any key.
+    pub fn range_len(&self) -> u64 {
+        // Key format: "path\x1Fstart-end"
+        // Find the separator, then parse the "start-end" suffix.
+        if let Some(sep_pos) = self.0.find(SEPARATOR) {
+            let range_part = &self.0[sep_pos + SEPARATOR.len_utf8()..];
+            if let Some(dash_pos) = range_part.find('-') {
+                let start_str = &range_part[..dash_pos];
+                let end_str   = &range_part[dash_pos + 1..];
+                if let (Ok(start), Ok(end)) = (start_str.parse::<u64>(), end_str.parse::<u64>()) {
+                    return end.saturating_sub(start);
+                }
+            }
+        }
+        0
+    }
 }
 
 // ── Range entry helpers ───────────────────────────────────────────────────────

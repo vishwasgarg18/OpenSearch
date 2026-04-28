@@ -56,7 +56,7 @@ import static org.opensearch.index.store.remote.utils.FileTypeUtils.INDICES_FOLD
  * @opensearch.api
  */
 @PublicApi(since = "2.7.0")
-public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
+public class FileCache implements RefCountedCache<Path, CachedIndexInput>, CacheStatsProvider {
     private static final Logger logger = LogManager.getLogger(FileCache.class);
     private final SegmentedCache<Path, CachedIndexInput> theCache;
 
@@ -237,6 +237,40 @@ public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
                 throw new UncheckedIOException("Unable to retrieve cache file details. Please clear the file cache for node startup.", e);
             }
         });
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Reads stats directly from the underlying {@link SegmentedCache}'s in-memory
+     * counters. Maps to the {@link CacheStats} fields as follows:
+     * <ul>
+     *   <li>{@code hits} = overall hit count across all cache segments</li>
+     *   <li>{@code misses} = overall miss count across all cache segments</li>
+     *   <li>{@code usedBytes} = {@link #usage()} (bytes currently resident)</li>
+     *   <li>{@code evictedBytes} = total bytes removed by LRU pressure</li>
+     *   <li>{@code removedBytes} = total bytes removed by lifecycle (shard close)</li>
+     *   <li>{@code totalBytes} = {@link #capacity()} (configured capacity)</li>
+     * </ul>
+     */
+    @Override
+    public CacheStats cacheStats() {
+        final AggregateRefCountedCacheStats stats = (AggregateRefCountedCacheStats) stats();
+        final org.opensearch.index.store.remote.utils.cache.stats.RefCountedCacheStats overall = stats.getOverallCacheStats();
+        // TODO: add hitWeight/missWeight to DefaultStatsCounter so FileCache can report
+        // exact byte-level effectiveness. For now, hitBytes/missBytes are 0 because
+        // RefCountedCacheStats only tracks evictionWeight/removeWeight, not hit/miss weights.
+        // FileCache uses fixed ~8 MB Lucene blocks so count-based hit rate is a reliable proxy.
+        return new CacheStats(
+            overall.hitCount(),
+            0L,                      // hitBytes: TODO wire via DefaultStatsCounter.hitWeight()
+            overall.missCount(),
+            0L,                      // missBytes: TODO wire via DefaultStatsCounter.missWeight()
+            overall.usage(),
+            overall.evictionWeight(),
+            overall.removeWeight(),
+            capacity()
+        );
     }
 
     /**

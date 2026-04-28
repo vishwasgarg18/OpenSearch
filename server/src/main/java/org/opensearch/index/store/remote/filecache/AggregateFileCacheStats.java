@@ -133,6 +133,90 @@ public class AggregateFileCacheStats implements Writeable, ToXContentFragment {
         return blockFileCacheStats;
     }
 
+    /**
+     * Merges FileCache stats with block cache stats to produce a unified
+     * {@code AggregateFileCacheStats} for the {@code aggregate_file_cache} JSON section.
+     *
+     * <p>Merge rules:
+     * <ul>
+     *   <li><b>Top-level fields</b> (hit_count, used_in_bytes, etc.) = FileCache + block cache
+     *       combined. These are the cross-cache rollup visible at the top of
+     *       {@code aggregate_file_cache}.</li>
+     *   <li><b>{@code over_all_stats}</b> = FileCache + block cache combined (same as top-level).
+     *       This is deliberately changed to reflect the true node-level cache picture.</li>
+     *   <li><b>{@code block_file_stats}</b> = FileCache block-file stats + block cache stats.
+     *       Both represent block-level caching (fixed Lucene blocks and variable columnar
+     *       blocks respectively), so they are merged into a single "block cache" view.</li>
+     *   <li><b>{@code full_file_stats}</b> = FileCache only, unchanged.</li>
+     *   <li><b>{@code pinned_file_stats}</b> = FileCache only, unchanged.</li>
+     * </ul>
+     *
+     * <p>Fields that are FileCache-only concepts (active_in_bytes, pinned_in_bytes,
+     * active_percent) always reflect FileCache values — the block cache has no notion
+     * of ref-counting or pinning.
+     *
+     * @param fileCacheStats  the existing stats from {@link FileCache#fileCacheStats()}
+     * @param blockCacheStats the stats snapshot from the block cache's
+     *                        {@link CacheStatsProvider#cacheStats()}
+     * @return a new {@code AggregateFileCacheStats} with the cross-cache rollup applied
+     */
+    public static AggregateFileCacheStats merge(AggregateFileCacheStats fileCacheStats, CacheStats blockCacheStats) {
+        // ─── 1. Cross-cache total (FileCache overall + block cache) ───────────────
+        CacheStats fileCacheOverall = new CacheStats(
+            fileCacheStats.getCacheHits(),
+            fileCacheStats.getCacheMisses(),
+            fileCacheStats.getUsed().getBytes(),
+            fileCacheStats.getEvicted().getBytes(),
+            fileCacheStats.getRemoved().getBytes(),
+            fileCacheStats.getTotal().getBytes()
+        );
+        CacheStats total = CacheStats.add(fileCacheOverall, blockCacheStats);
+
+        // ─── 2. Merged overall = cross-cache sum (drives top-level JSON fields) ───
+        FileCacheStats mergedOverall = new FileCacheStats(
+            fileCacheStats.getActive().getBytes(),      // active: FileCache ref-count concept only
+            total.totalBytes,
+            total.usedBytes,
+            fileCacheStats.getPinnedUsage().getBytes(), // pinned: FileCache concept only
+            total.evictedBytes,
+            total.removedBytes,
+            total.hits,
+            total.misses,
+            FileCacheStatsType.OVER_ALL_STATS
+        );
+
+        // ─── 3. block_file_stats = FileCache block stats + block cache stats ──────
+        FileCacheStats fileBlockStats = fileCacheStats.blockFileCacheStats;
+        CacheStats fileBlockContrib = new CacheStats(
+            fileBlockStats.getCacheHits(),
+            fileBlockStats.getCacheMisses(),
+            fileBlockStats.getUsed(),
+            fileBlockStats.getEvicted(),
+            fileBlockStats.getRemoved(),
+            fileBlockStats.getTotal()
+        );
+        CacheStats mergedBlockContrib = CacheStats.add(fileBlockContrib, blockCacheStats);
+        FileCacheStats mergedBlockStats = new FileCacheStats(
+            fileBlockStats.getActive(),                 // active: FileCache block concept only
+            mergedBlockContrib.totalBytes,
+            mergedBlockContrib.usedBytes,
+            fileBlockStats.getPinnedUsage(),            // pinned: FileCache concept only
+            mergedBlockContrib.evictedBytes,
+            mergedBlockContrib.removedBytes,
+            mergedBlockContrib.hits,
+            mergedBlockContrib.misses,
+            FileCacheStatsType.BLOCK_FILE_STATS
+        );
+
+        return new AggregateFileCacheStats(
+            fileCacheStats.getTimestamp(),
+            mergedOverall,                         // top-level = cross-cache sum
+            fileCacheStats.fullFileCacheStats,     // FileCache only, unchanged
+            mergedBlockStats,                      // FileCache block + block cache merged
+            fileCacheStats.pinnedFileCacheStats    // FileCache only, unchanged
+        );
+    }
+
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
         builder.startObject(Fields.AGGREGATE_FILE_CACHE);
