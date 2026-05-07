@@ -19,6 +19,7 @@ import org.opensearch.index.store.Store;
 import org.opensearch.index.store.StoreStats;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheSettings;
+import org.opensearch.index.store.remote.filecache.NodeCacheOrchestrator;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -33,12 +34,22 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+/**
+ * Unit tests for {@link WarmFsService}.
+ *
+ * <p>The constructor takes a {@link NodeCacheOrchestrator} (not a raw {@link FileCache}) and a
+ * pre-computed {@code virtualBlockCacheBytes} value. Virtual total capacity is:
+ * <pre>
+ *   total = (dataToFileCacheRatio × fileCacheCapacity) + virtualBlockCacheBytes
+ * </pre>
+ */
 public class WarmFsServiceTests extends OpenSearchTestCase {
 
     private Settings settings;
     private FileCacheSettings fileCacheSettings;
     private IndicesService indicesService;
     private FileCache fileCache;
+    private NodeCacheOrchestrator orchestrator;
 
     @Override
     public void setUp() throws Exception {
@@ -47,419 +58,339 @@ public class WarmFsServiceTests extends OpenSearchTestCase {
         fileCacheSettings = mock(FileCacheSettings.class);
         indicesService = mock(IndicesService.class);
         fileCache = mock(FileCache.class);
+        orchestrator = mock(NodeCacheOrchestrator.class);
+        when(orchestrator.fileCache()).thenReturn(fileCache);
     }
 
-    public void testStatsWithNormalOperation() throws Exception {
-        // Setup
-        double dataToFileCacheSizeRatio = 5.0;
-        long fileCacheCapacity = 100L * 1024 * 1024; // 100MB
-        long fileCacheUsage = 20L * 1024 * 1024; // 20MB
-        long shard1Size = 50L * 1024 * 1024; // 50MB
-        long shard2Size = 30L * 1024 * 1024; // 30MB
+    // ── Normal operation ──────────────────────────────────────────────────────
 
-        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(dataToFileCacheSizeRatio);
+    public void testStatsWithNormalOperationNoBlockCache() throws Exception {
+        double fileCacheRatio = 5.0;
+        long fileCacheCapacity = 100L * 1024 * 1024; // 100 MB
+        long fileCacheUsage    = 20L  * 1024 * 1024; // 20 MB
+        long shard1Size        = 50L  * 1024 * 1024; // 50 MB
+        long shard2Size        = 30L  * 1024 * 1024; // 30 MB
+        long blockCacheCapacity = 0L;
+        long virtualBlockCacheBytes = 0L;
+
+        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(fileCacheRatio);
         when(fileCache.capacity()).thenReturn(fileCacheCapacity);
-        when(fileCache.usage()).thenReturn(fileCacheUsage);
+        when(orchestrator.blockCacheCapacityBytes()).thenReturn(blockCacheCapacity);
+        when(orchestrator.cacheUtilizedBytes()).thenReturn(fileCacheUsage);
 
-        // Mock indices and shards
         IndexService indexService = mockIndexService(shard1Size, shard2Size);
         when(indicesService.iterator()).thenReturn(Collections.singletonList(indexService).iterator());
 
-        // Create service and get stats
         try (var nodeEnv = newNodeEnvironment()) {
-            WarmFsService warmFsService = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService, fileCache);
-            FsInfo fsInfo = warmFsService.stats();
+            WarmFsService svc = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService,
+                orchestrator, virtualBlockCacheBytes);
+            FsInfo fsInfo = svc.stats();
 
-            // Verify
             assertNotNull(fsInfo);
-            List<FsInfo.Path> paths = new ArrayList<>();
-            for (FsInfo.Path path : fsInfo) {
-                paths.add(path);
-            }
-            assertEquals(1, paths.size());
+            FsInfo.Path warmPath = getSinglePath(fsInfo);
 
-            FsInfo.Path warmPath = paths.get(0);
             assertEquals("/warm", warmPath.path);
             assertEquals("warm", warmPath.mount);
             assertEquals("warm", warmPath.type);
 
-            long expectedTotal = (long) (dataToFileCacheSizeRatio * fileCacheCapacity);
-            long expectedUsed = shard1Size + shard2Size;
-            long expectedFree = expectedTotal - expectedUsed;
+            long expectedTotal = (long)(fileCacheRatio * fileCacheCapacity) + virtualBlockCacheBytes;
+            long expectedUsed  = shard1Size + shard2Size;
+            long expectedFree  = expectedTotal - expectedUsed;
 
             assertEquals(expectedTotal, warmPath.total);
-            assertEquals(expectedFree, warmPath.free);
-            assertEquals(expectedFree, warmPath.available);
-            assertEquals(fileCacheCapacity, warmPath.fileCacheReserved);
+            assertEquals(expectedFree,  warmPath.free);
+            assertEquals(expectedFree,  warmPath.available);
+            assertEquals(fileCacheCapacity + blockCacheCapacity, warmPath.fileCacheReserved);
             assertEquals(fileCacheUsage, warmPath.fileCacheUtilized);
         }
     }
 
-    public void testStatsWithNullFileCache() throws Exception {
-        // Setup
-        double dataToFileCacheSizeRatio = 5.0;
-        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(dataToFileCacheSizeRatio);
+    public void testStatsIncludesVirtualBlockCacheBytes() throws Exception {
+        double fileCacheRatio = 5.0;
+        long fileCacheCapacity      = 100L * 1024 * 1024; // 100 MB
+        long blockCacheCapacity     = 200L * 1024 * 1024; // 200 MB physical
+        long virtualBlockCacheBytes = 1000L * 1024 * 1024; // 1 GB virtual (e.g. 5× ratio)
 
-        long shard1Size = 50L * 1024 * 1024; // 50MB
-        long shard2Size = 30L * 1024 * 1024; // 30MB
+        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(fileCacheRatio);
+        when(fileCache.capacity()).thenReturn(fileCacheCapacity);
+        when(orchestrator.blockCacheCapacityBytes()).thenReturn(blockCacheCapacity);
+        when(orchestrator.cacheUtilizedBytes()).thenReturn(0L);
+        when(indicesService.iterator()).thenReturn(Collections.emptyIterator());
 
-        // Mock indices and shards
-        IndexService indexService = mockIndexService(shard1Size, shard2Size);
-        when(indicesService.iterator()).thenReturn(Collections.singletonList(indexService).iterator());
-
-        // Create service with null file cache
         try (var nodeEnv = newNodeEnvironment()) {
-            WarmFsService warmFsService = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService, null);
-            FsInfo fsInfo = warmFsService.stats();
+            WarmFsService svc = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService,
+                orchestrator, virtualBlockCacheBytes);
+            FsInfo fsInfo = svc.stats();
+            FsInfo.Path warmPath = getSinglePath(fsInfo);
 
-            // Verify
-            assertNotNull(fsInfo);
-            List<FsInfo.Path> paths = new ArrayList<>();
-            for (FsInfo.Path path : fsInfo) {
-                paths.add(path);
-            }
-            assertEquals(1, paths.size());
-
-            FsInfo.Path warmPath = paths.get(0);
-            assertEquals("/warm", warmPath.path);
-            assertEquals("warm", warmPath.mount);
-            assertEquals("warm", warmPath.type);
-            assertEquals(0L, warmPath.total);
-            assertEquals(0L, warmPath.free);
-            assertEquals(0L, warmPath.available);
-            assertEquals(-1L, warmPath.fileCacheReserved);
-            assertEquals(0L, warmPath.fileCacheUtilized);
+            long expectedTotal = (long)(fileCacheRatio * fileCacheCapacity) + virtualBlockCacheBytes;
+            assertEquals(expectedTotal, warmPath.total);
+            // fileCacheReserved = fileCache + blockCache physical capacity
+            assertEquals(fileCacheCapacity + blockCacheCapacity, warmPath.fileCacheReserved);
         }
     }
 
     public void testStatsWithNullIndicesService() throws IOException {
-        // Setup
-        double dataToFileCacheSizeRatio = 5.0;
-        long fileCacheCapacity = 100L * 1024 * 1024; // 100MB
-        long fileCacheUsage = 20L * 1024 * 1024; // 20MB
+        double fileCacheRatio    = 5.0;
+        long fileCacheCapacity   = 100L * 1024 * 1024;
+        long fileCacheUsage      = 20L  * 1024 * 1024;
 
-        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(dataToFileCacheSizeRatio);
+        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(fileCacheRatio);
         when(fileCache.capacity()).thenReturn(fileCacheCapacity);
-        when(fileCache.usage()).thenReturn(fileCacheUsage);
+        when(orchestrator.blockCacheCapacityBytes()).thenReturn(0L);
+        when(orchestrator.cacheUtilizedBytes()).thenReturn(fileCacheUsage);
 
-        // Create service with null indices service
         try (var nodeEnv = newNodeEnvironment()) {
-            WarmFsService warmFsService = new WarmFsService(settings, nodeEnv, fileCacheSettings, null, fileCache);
-            FsInfo fsInfo = warmFsService.stats();
+            WarmFsService svc = new WarmFsService(settings, nodeEnv, fileCacheSettings, null,
+                orchestrator, 0L);
+            FsInfo fsInfo = svc.stats();
 
-            // Verify
-            assertNotNull(fsInfo);
-            List<FsInfo.Path> paths = new ArrayList<>();
-            for (FsInfo.Path path : fsInfo) {
-                paths.add(path);
-            }
-            assertEquals(1, paths.size());
-
-            FsInfo.Path warmPath = paths.get(0);
-            long expectedTotal = (long) (dataToFileCacheSizeRatio * fileCacheCapacity);
+            FsInfo.Path warmPath = getSinglePath(fsInfo);
+            long expectedTotal = (long)(fileCacheRatio * fileCacheCapacity);
             assertEquals(expectedTotal, warmPath.total);
-            assertEquals(expectedTotal, warmPath.free); // No used bytes since no indices
+            assertEquals(expectedTotal, warmPath.free);     // no shards
             assertEquals(expectedTotal, warmPath.available);
         }
     }
 
     public void testStatsWithNonPrimaryShards() throws Exception {
-        // Setup
-        double dataToFileCacheSizeRatio = 5.0;
-        long fileCacheCapacity = 100L * 1024 * 1024; // 100MB
-        long fileCacheUsage = 20L * 1024 * 1024; // 20MB
+        double fileCacheRatio  = 5.0;
+        long fileCacheCapacity = 100L * 1024 * 1024;
 
-        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(dataToFileCacheSizeRatio);
+        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(fileCacheRatio);
         when(fileCache.capacity()).thenReturn(fileCacheCapacity);
-        when(fileCache.usage()).thenReturn(fileCacheUsage);
+        when(orchestrator.blockCacheCapacityBytes()).thenReturn(0L);
+        when(orchestrator.cacheUtilizedBytes()).thenReturn(0L);
 
-        // Create shards - one primary, one replica
-        List<IndexShard> shards = new ArrayList<>();
-        IndexShard primaryShard = mockShard(true, true, 50L * 1024 * 1024); // Primary, 50MB
-        IndexShard replicaShard = mockShard(false, true, 30L * 1024 * 1024); // Replica, 30MB
-        shards.add(primaryShard);
-        shards.add(replicaShard);
-
-        IndexService indexService = mock(IndexService.class);
-        when(indexService.iterator()).thenReturn(shards.iterator());
+        IndexShard primaryShard = mockShard(true,  true,  50L * 1024 * 1024);
+        IndexShard replicaShard = mockShard(false, true,  30L * 1024 * 1024);
+        IndexService indexService = mockIndexService(primaryShard, replicaShard);
         when(indicesService.iterator()).thenReturn(Collections.singletonList(indexService).iterator());
 
-        // Create service and get stats
         try (var nodeEnv = newNodeEnvironment()) {
-            WarmFsService warmFsService = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService, fileCache);
-            FsInfo fsInfo = warmFsService.stats();
+            WarmFsService svc = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService,
+                orchestrator, 0L);
+            FsInfo fsInfo = svc.stats();
+            FsInfo.Path warmPath = getSinglePath(fsInfo);
 
-            // Verify only primary shard size is counted
-            List<FsInfo.Path> paths = new ArrayList<>();
-            for (FsInfo.Path path : fsInfo) {
-                paths.add(path);
-            }
-            FsInfo.Path warmPath = paths.get(0);
-            long expectedTotal = (long) (dataToFileCacheSizeRatio * fileCacheCapacity);
-            long expectedUsed = 50L * 1024 * 1024; // Only primary shard
-            long expectedFree = expectedTotal - expectedUsed;
-
+            long expectedTotal = (long)(fileCacheRatio * fileCacheCapacity);
+            long expectedUsed  = 50L * 1024 * 1024; // only primary
             assertEquals(expectedTotal, warmPath.total);
-            assertEquals(expectedFree, warmPath.free);
-            assertEquals(expectedFree, warmPath.available);
+            assertEquals(expectedTotal - expectedUsed, warmPath.free);
 
-            // Verify that store.stats was only called on primary shard
             verify(primaryShard.store()).stats(anyLong());
             verify(replicaShard.store(), never()).stats(anyLong());
         }
     }
 
     public void testStatsWithInactiveShards() throws Exception {
-        // Setup
-        double dataToFileCacheSizeRatio = 5.0;
-        long fileCacheCapacity = 100L * 1024 * 1024; // 100MB
-        long fileCacheUsage = 20L * 1024 * 1024; // 20MB
+        double fileCacheRatio  = 5.0;
+        long fileCacheCapacity = 100L * 1024 * 1024;
 
-        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(dataToFileCacheSizeRatio);
+        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(fileCacheRatio);
         when(fileCache.capacity()).thenReturn(fileCacheCapacity);
-        when(fileCache.usage()).thenReturn(fileCacheUsage);
+        when(orchestrator.blockCacheCapacityBytes()).thenReturn(0L);
+        when(orchestrator.cacheUtilizedBytes()).thenReturn(0L);
 
-        // Create shards - one active, one inactive
-        List<IndexShard> shards = new ArrayList<>();
-        IndexShard activeShard = mockShard(true, true, 50L * 1024 * 1024); // Active primary, 50MB
-        IndexShard inactiveShard = mockShard(true, false, 30L * 1024 * 1024); // Inactive primary, 30MB
-        shards.add(activeShard);
-        shards.add(inactiveShard);
-
-        IndexService indexService = mock(IndexService.class);
-        when(indexService.iterator()).thenReturn(shards.iterator());
+        IndexShard activeShard   = mockShard(true, true,  50L * 1024 * 1024);
+        IndexShard inactiveShard = mockShard(true, false, 30L * 1024 * 1024);
+        IndexService indexService = mockIndexService(activeShard, inactiveShard);
         when(indicesService.iterator()).thenReturn(Collections.singletonList(indexService).iterator());
 
-        // Create service and get stats
         try (var nodeEnv = newNodeEnvironment()) {
-            WarmFsService warmFsService = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService, fileCache);
-            FsInfo fsInfo = warmFsService.stats();
+            WarmFsService svc = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService,
+                orchestrator, 0L);
+            FsInfo fsInfo = svc.stats();
+            FsInfo.Path warmPath = getSinglePath(fsInfo);
 
-            // Verify only active shard size is counted
-            List<FsInfo.Path> paths = new ArrayList<>();
-            for (FsInfo.Path path : fsInfo) {
-                paths.add(path);
-            }
-            FsInfo.Path warmPath = paths.get(0);
-            long expectedTotal = (long) (dataToFileCacheSizeRatio * fileCacheCapacity);
-            long expectedUsed = 50L * 1024 * 1024; // Only active shard
-            long expectedFree = expectedTotal - expectedUsed;
+            long expectedTotal = (long)(fileCacheRatio * fileCacheCapacity);
+            long expectedUsed  = 50L * 1024 * 1024; // only active
+            assertEquals(expectedTotal - expectedUsed, warmPath.free);
 
-            assertEquals(expectedTotal, warmPath.total);
-            assertEquals(expectedFree, warmPath.free);
-            assertEquals(expectedFree, warmPath.available);
-
-            // Verify that store.stats was only called on active shard
             verify(activeShard.store()).stats(anyLong());
             verify(inactiveShard.store(), never()).stats(anyLong());
         }
     }
 
     public void testStatsWithNullRoutingEntry() throws Exception {
-        // Setup
-        double dataToFileCacheSizeRatio = 5.0;
-        long fileCacheCapacity = 100L * 1024 * 1024; // 100MB
-        long fileCacheUsage = 20L * 1024 * 1024; // 20MB
+        double fileCacheRatio  = 5.0;
+        long fileCacheCapacity = 100L * 1024 * 1024;
 
-        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(dataToFileCacheSizeRatio);
+        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(fileCacheRatio);
         when(fileCache.capacity()).thenReturn(fileCacheCapacity);
-        when(fileCache.usage()).thenReturn(fileCacheUsage);
+        when(orchestrator.blockCacheCapacityBytes()).thenReturn(0L);
+        when(orchestrator.cacheUtilizedBytes()).thenReturn(0L);
 
-        // Create shard with null routing entry
         IndexShard shard = mock(IndexShard.class);
         when(shard.routingEntry()).thenReturn(null);
-
-        List<IndexShard> shards = Collections.singletonList(shard);
-        IndexService indexService = mock(IndexService.class);
-        when(indexService.iterator()).thenReturn(shards.iterator());
+        IndexService indexService = mockIndexService(shard);
         when(indicesService.iterator()).thenReturn(Collections.singletonList(indexService).iterator());
 
-        // Create service and get stats
         try (var nodeEnv = newNodeEnvironment()) {
-            WarmFsService warmFsService = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService, fileCache);
-            FsInfo fsInfo = warmFsService.stats();
+            WarmFsService svc = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService,
+                orchestrator, 0L);
+            FsInfo fsInfo = svc.stats();
+            FsInfo.Path warmPath = getSinglePath(fsInfo);
 
-            // Verify
-            List<FsInfo.Path> paths = new ArrayList<>();
-            for (FsInfo.Path path : fsInfo) {
-                paths.add(path);
-            }
-            FsInfo.Path warmPath = paths.get(0);
-            long expectedTotal = (long) (dataToFileCacheSizeRatio * fileCacheCapacity);
+            long expectedTotal = (long)(fileCacheRatio * fileCacheCapacity);
             assertEquals(expectedTotal, warmPath.total);
-            assertEquals(expectedTotal, warmPath.free); // No used bytes since shard has null routing
-            assertEquals(expectedTotal, warmPath.available);
+            assertEquals(expectedTotal, warmPath.free); // shard skipped
 
-            // Verify that store.stats was never called
             verify(shard, never()).store();
         }
     }
 
     public void testStatsWithExceptionWhileGettingShardSize() throws Exception {
-        // Setup
-        double dataToFileCacheSizeRatio = 5.0;
-        long fileCacheCapacity = 100L * 1024 * 1024; // 100MB
-        long fileCacheUsage = 20L * 1024 * 1024; // 20MB
-        long shard1Size = 50L * 1024 * 1024; // 50MB
+        double fileCacheRatio  = 5.0;
+        long fileCacheCapacity = 100L * 1024 * 1024;
+        long shard1Size        = 50L  * 1024 * 1024;
 
-        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(dataToFileCacheSizeRatio);
+        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(fileCacheRatio);
         when(fileCache.capacity()).thenReturn(fileCacheCapacity);
-        when(fileCache.usage()).thenReturn(fileCacheUsage);
+        when(orchestrator.blockCacheCapacityBytes()).thenReturn(0L);
+        when(orchestrator.cacheUtilizedBytes()).thenReturn(0L);
 
-        // Create shards - one normal, one that throws exception
-        List<IndexShard> shards = new ArrayList<>();
         IndexShard normalShard = mockShard(true, true, shard1Size);
-        IndexShard errorShard = mockShardWithError(true, true);
-        shards.add(normalShard);
-        shards.add(errorShard);
-
-        IndexService indexService = mock(IndexService.class);
-        when(indexService.iterator()).thenReturn(shards.iterator());
+        IndexShard errorShard  = mockShardWithError(true, true);
+        IndexService indexService = mockIndexService(normalShard, errorShard);
         when(indicesService.iterator()).thenReturn(Collections.singletonList(indexService).iterator());
 
-        // Create service and get stats
         try (var nodeEnv = newNodeEnvironment()) {
-            WarmFsService warmFsService = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService, fileCache);
-            FsInfo fsInfo = warmFsService.stats();
+            WarmFsService svc = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService,
+                orchestrator, 0L);
+            FsInfo fsInfo = svc.stats();
+            FsInfo.Path warmPath = getSinglePath(fsInfo);
 
-            // Verify only normal shard size is counted
-            List<FsInfo.Path> paths = new ArrayList<>();
-            for (FsInfo.Path path : fsInfo) {
-                paths.add(path);
-            }
-            FsInfo.Path warmPath = paths.get(0);
-            long expectedTotal = (long) (dataToFileCacheSizeRatio * fileCacheCapacity);
-            long expectedUsed = shard1Size; // Only the normal shard
-            long expectedFree = expectedTotal - expectedUsed;
-
-            assertEquals(expectedTotal, warmPath.total);
+            long expectedTotal = (long)(fileCacheRatio * fileCacheCapacity);
+            long expectedFree  = expectedTotal - shard1Size; // error shard skipped
             assertEquals(expectedFree, warmPath.free);
-            assertEquals(expectedFree, warmPath.available);
         }
     }
 
-    public void testStatsWithUsedBytesExceedingTotal() throws Exception {
-        // Setup
-        double dataToFileCacheSizeRatio = 1.0; // Small ratio
-        long fileCacheCapacity = 10L * 1024 * 1024; // 10MB
-        long fileCacheUsage = 5L * 1024 * 1024; // 5MB
-        long shard1Size = 20L * 1024 * 1024; // 20MB - larger than total
+    public void testStatsWithUsedBytesExceedingTotalClampsToZero() throws Exception {
+        double fileCacheRatio  = 1.0; // 1:1 ratio, small virtual space
+        long fileCacheCapacity = 10L * 1024 * 1024;  // 10 MB virtual
+        long shardSize         = 20L * 1024 * 1024;  // 20 MB used — exceeds total
 
-        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(dataToFileCacheSizeRatio);
+        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(fileCacheRatio);
         when(fileCache.capacity()).thenReturn(fileCacheCapacity);
-        when(fileCache.usage()).thenReturn(fileCacheUsage);
+        when(orchestrator.blockCacheCapacityBytes()).thenReturn(0L);
+        when(orchestrator.cacheUtilizedBytes()).thenReturn(0L);
 
-        // Mock indices and shards
-        IndexService indexService = mockIndexService(shard1Size);
+        IndexService indexService = mockIndexService(mockShard(true, true, shardSize));
         when(indicesService.iterator()).thenReturn(Collections.singletonList(indexService).iterator());
 
-        // Create service and get stats
         try (var nodeEnv = newNodeEnvironment()) {
-            WarmFsService warmFsService = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService, fileCache);
-            FsInfo fsInfo = warmFsService.stats();
+            WarmFsService svc = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService,
+                orchestrator, 0L);
+            FsInfo fsInfo = svc.stats();
+            FsInfo.Path warmPath = getSinglePath(fsInfo);
 
-            // Verify free bytes is 0 (not negative)
-            List<FsInfo.Path> paths = new ArrayList<>();
-            for (FsInfo.Path path : fsInfo) {
-                paths.add(path);
-            }
-            FsInfo.Path warmPath = paths.get(0);
-            long expectedTotal = (long) (dataToFileCacheSizeRatio * fileCacheCapacity);
-
-            assertEquals(expectedTotal, warmPath.total);
-            assertEquals(0L, warmPath.free); // Math.max(0, negative) = 0
+            assertEquals(0L, warmPath.free);     // Math.max(0, negative) = 0
             assertEquals(0L, warmPath.available);
         }
     }
 
     public void testStatsWithMultipleIndices() throws Exception {
-        // Setup
-        double dataToFileCacheSizeRatio = 5.0;
-        long fileCacheCapacity = 200L * 1024 * 1024; // 200MB
-        long fileCacheUsage = 40L * 1024 * 1024; // 40MB
+        double fileCacheRatio  = 5.0;
+        long fileCacheCapacity = 200L * 1024 * 1024;
 
-        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(dataToFileCacheSizeRatio);
+        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(fileCacheRatio);
         when(fileCache.capacity()).thenReturn(fileCacheCapacity);
-        when(fileCache.usage()).thenReturn(fileCacheUsage);
+        when(orchestrator.blockCacheCapacityBytes()).thenReturn(0L);
+        when(orchestrator.cacheUtilizedBytes()).thenReturn(0L);
 
-        // Mock multiple indices
-        IndexService indexService1 = mockIndexService(50L * 1024 * 1024, 30L * 1024 * 1024);
-        IndexService indexService2 = mockIndexService(20L * 1024 * 1024, 10L * 1024 * 1024);
+        IndexService idx1 = mockIndexService(
+            mockShard(true, true, 50L * 1024 * 1024),
+            mockShard(true, true, 30L * 1024 * 1024));
+        IndexService idx2 = mockIndexService(
+            mockShard(true, true, 20L * 1024 * 1024),
+            mockShard(true, true, 10L * 1024 * 1024));
+        when(indicesService.iterator()).thenReturn(List.of(idx1, idx2).iterator());
 
-        List<IndexService> indexServices = new ArrayList<>();
-        indexServices.add(indexService1);
-        indexServices.add(indexService2);
-        when(indicesService.iterator()).thenReturn(indexServices.iterator());
-
-        // Create service and get stats
         try (var nodeEnv = newNodeEnvironment()) {
-            WarmFsService warmFsService = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService, fileCache);
-            FsInfo fsInfo = warmFsService.stats();
+            WarmFsService svc = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService,
+                orchestrator, 0L);
+            FsInfo fsInfo = svc.stats();
+            FsInfo.Path warmPath = getSinglePath(fsInfo);
 
-            // Verify
-            List<FsInfo.Path> paths = new ArrayList<>();
-            for (FsInfo.Path path : fsInfo) {
-                paths.add(path);
-            }
-            FsInfo.Path warmPath = paths.get(0);
-            long expectedTotal = (long) (dataToFileCacheSizeRatio * fileCacheCapacity);
-            long expectedUsed = 50L * 1024 * 1024 + 30L * 1024 * 1024 + 20L * 1024 * 1024 + 10L * 1024 * 1024; // All shards
-            long expectedFree = expectedTotal - expectedUsed;
-
-            assertEquals(expectedTotal, warmPath.total);
-            assertEquals(expectedFree, warmPath.free);
-            assertEquals(expectedFree, warmPath.available);
+            long expectedTotal = (long)(fileCacheRatio * fileCacheCapacity);
+            long expectedUsed  = (50 + 30 + 20 + 10) * 1024 * 1024L;
+            assertEquals(expectedTotal - expectedUsed, warmPath.free);
         }
     }
 
-    // Helper methods
+    public void testStatsReturnsExactlyOnePath() throws IOException {
+        when(fileCacheSettings.getRemoteDataRatio()).thenReturn(1.0);
+        when(fileCache.capacity()).thenReturn(1L);
+        when(orchestrator.blockCacheCapacityBytes()).thenReturn(0L);
+        when(orchestrator.cacheUtilizedBytes()).thenReturn(0L);
+        when(indicesService.iterator()).thenReturn(Collections.emptyIterator());
+
+        try (var nodeEnv = newNodeEnvironment()) {
+            WarmFsService svc = new WarmFsService(settings, nodeEnv, fileCacheSettings, indicesService,
+                orchestrator, 0L);
+            List<FsInfo.Path> paths = new ArrayList<>();
+            for (FsInfo.Path p : svc.stats()) {
+                paths.add(p);
+            }
+            assertEquals(1, paths.size());
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private FsInfo.Path getSinglePath(FsInfo fsInfo) {
+        List<FsInfo.Path> paths = new ArrayList<>();
+        for (FsInfo.Path p : fsInfo) paths.add(p);
+        assertEquals("expected exactly one path", 1, paths.size());
+        return paths.get(0);
+    }
+
+    @SafeVarargs
+    private IndexService mockIndexService(IndexShard... shards) {
+        IndexService svc = mock(IndexService.class);
+        when(svc.iterator()).thenReturn(List.of(shards).iterator());
+        return svc;
+    }
 
     private IndexService mockIndexService(long... shardSizes) throws Exception {
         List<IndexShard> shards = new ArrayList<>();
-        for (long size : shardSizes) {
-            shards.add(mockShard(true, true, size));
-        }
-
-        IndexService indexService = mock(IndexService.class);
-        when(indexService.iterator()).thenReturn(shards.iterator());
-        return indexService;
+        for (long size : shardSizes) shards.add(mockShard(true, true, size));
+        IndexService svc = mock(IndexService.class);
+        when(svc.iterator()).thenReturn(shards.iterator());
+        return svc;
     }
 
-    private IndexShard mockShard(boolean isPrimary, boolean isActive, long sizeInBytes) throws Exception {
+    private IndexShard mockShard(boolean isPrimary, boolean isActive, long sizeBytes) throws Exception {
         IndexShard shard = mock(IndexShard.class);
-        ShardRouting shardRouting = TestShardRouting.newShardRouting(
-            new ShardId("test", "_na_", 0),
-            "node1",
-            isPrimary,
+        ShardRouting routing = TestShardRouting.newShardRouting(
+            new ShardId("test", "_na_", 0), "node1", isPrimary,
             isActive ? ShardRoutingState.STARTED : ShardRoutingState.INITIALIZING
         );
-        when(shard.routingEntry()).thenReturn(shardRouting);
-        when(shard.shardId()).thenReturn(shardRouting.shardId());
+        when(shard.routingEntry()).thenReturn(routing);
+        when(shard.shardId()).thenReturn(routing.shardId());
 
-        Store store = mock(Store.class);
-        StoreStats storeStats = mock(StoreStats.class);
-        when(storeStats.getSizeInBytes()).thenReturn(sizeInBytes);
-        when(store.stats(anyLong())).thenReturn(storeStats);
+        Store store      = mock(Store.class);
+        StoreStats stats = mock(StoreStats.class);
+        when(stats.getSizeInBytes()).thenReturn(sizeBytes);
+        when(store.stats(anyLong())).thenReturn(stats);
         when(shard.store()).thenReturn(store);
-
         return shard;
     }
 
     private IndexShard mockShardWithError(boolean isPrimary, boolean isActive) throws Exception {
         IndexShard shard = mock(IndexShard.class);
-        ShardRouting shardRouting = TestShardRouting.newShardRouting(
-            new ShardId("test", "_na_", 1),
-            "node1",
-            isPrimary,
+        ShardRouting routing = TestShardRouting.newShardRouting(
+            new ShardId("test", "_na_", 1), "node1", isPrimary,
             isActive ? ShardRoutingState.STARTED : ShardRoutingState.INITIALIZING
         );
-        when(shard.routingEntry()).thenReturn(shardRouting);
-        when(shard.shardId()).thenReturn(shardRouting.shardId());
+        when(shard.routingEntry()).thenReturn(routing);
+        when(shard.shardId()).thenReturn(routing.shardId());
 
         Store store = mock(Store.class);
         when(store.stats(anyLong())).thenThrow(new RuntimeException("Test exception"));
         when(shard.store()).thenReturn(store);
-
         return shard;
     }
 }
