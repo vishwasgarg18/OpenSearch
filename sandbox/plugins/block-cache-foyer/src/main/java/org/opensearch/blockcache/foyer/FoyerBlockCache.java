@@ -33,18 +33,19 @@ public final class FoyerBlockCache implements BlockCache {
     /** Opaque native handle returned by {@code foyer_create_cache}. Always positive. */
     private final long cachePtr;
 
+    /** The configured disk capacity in bytes */
+    private final long diskBytes;
+
     /** Guards against double-close per the {@link AutoCloseable} contract. */
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     /**
      * Create the native Foyer cache and acquire its handle.
      *
-     * @param diskBytes      maximum disk capacity in bytes; must be {@code > 0}
-     * @param diskDir        directory where Foyer stores cache data; must not be null or blank
-     * @param blockSizeBytes Foyer disk block size in bytes; must be {@code > 0}.
-     *                       Typically read from {@code format_cache.block_size} (default 64 MB).
-     * @param ioEngine       I/O engine selection: {@code "auto"}, {@code "io_uring"}, or
-     *                       {@code "psync"}. Typically read from {@code format_cache.io_engine}.
+     * @param diskBytes       maximum disk capacity in bytes; must be {@code > 0}
+     * @param diskDir         directory where Foyer stores cache data; must not be null or blank
+     * @param blockSizeBytes  Foyer disk block size in bytes; must be {@code > 0}
+     * @param ioEngine        I/O engine: {@code "auto"}, {@code "io_uring"}, or {@code "psync"}
      * @throws IllegalArgumentException if {@code diskBytes <= 0}, {@code blockSizeBytes <= 0},
      *                                  or {@code diskDir} is blank
      * @throws NullPointerException     if {@code diskDir} or {@code ioEngine} is null
@@ -62,44 +63,57 @@ public final class FoyerBlockCache implements BlockCache {
             throw new IllegalArgumentException("blockSizeBytes must be > 0, got: " + blockSizeBytes);
         }
         Objects.requireNonNull(ioEngine, "ioEngine must not be null");
+        this.diskBytes = diskBytes;
         this.cachePtr = FoyerBridge.createCache(diskBytes, diskDir, blockSizeBytes, ioEngine);
     }
 
     /**
-     * Returns the opaque native cache pointer.
+     * Returns the opaque handle to the underlying native cache instance.
      *
-     * <p><strong>Native-aware callers only.</strong> This method lives outside
-     * the {@link BlockCache} interface to prevent leakage of the native handle
-     * into general-purpose code. Callers must first verify the runtime type
-     * with {@code instanceof FoyerBlockCache} before calling this method.
-     *
-     * @return the positive {@code long} handle to the native cache instance
+     * <p>Absent from {@link BlockCache} to confine native handle access to code
+     * that explicitly narrows the type to {@code FoyerBlockCache}.
      */
     public long nativeCachePtr() {
         return cachePtr;
     }
 
     /**
-     * Returns a point-in-time snapshot of cache counters.
+     * Snapshots cache statistics via FFM call to the native Foyer runtime.
+     * Returns the cross-tier rollup {@link BlockCacheStats} (section 0 of the
+     * native stats buffer) for core consumption.
      *
-     * <p>Foyer exposes its counters through the native library; bridging them
-     * into this record is a follow-up. Until then, this method returns a
-     * zero-valued snapshot so that callers that poll stats for logging or
-     * node-stats reporting continue to function without special-casing.
-     *
-     * @return zero-valued snapshot; never {@code null}
+     * <p>Delegates to {@link #foyerStats()} and returns the overall section
+     * directly — no projection step needed. Core code uses this method;
+     * Foyer-aware code that needs the disk-tier breakdown (section 1) should
+     * call {@link #foyerStats()} directly.
      */
     @Override
     public BlockCacheStats stats() {
-        // TODO: bridge real Foyer counters through FFM once the Rust-side accessor exists.
-        return new BlockCacheStats(0L, 0L, 0L, 0L, 0L);
+        return foyerStats().overallStats();
+    }
+
+    /**
+     * Snapshots the full two-section Foyer stats from the native runtime:
+     * <ul>
+     *   <li>section 0 — cross-tier overall rollup</li>
+     *   <li>section 1 — disk-tier (block-level) only</li>
+     * </ul>
+     *
+     * <p>Returns richer counters than {@link #stats()}: per-tier hit/miss/eviction
+     * byte counts, configured capacity, and the disk-tier breakdown. Intended for
+     * Foyer-internal logging, node-stats contributions, and any caller that
+     * explicitly narrows the {@link org.opensearch.plugins.BlockCache} reference
+     * to {@code FoyerBlockCache}.
+     *
+     * @return two-section snapshot; never {@code null}
+     */
+    public FoyerAggregatedStats foyerStats() {
+        long[] raw = FoyerBridge.snapshotStats(cachePtr);
+        return FoyerAggregatedStats.snapshot(raw, diskBytes);
     }
 
     /**
      * Destroys the native cache. Idempotent — safe to call multiple times.
-     *
-     * <p>Only the first invocation actually destroys the cache; subsequent
-     * calls are no-ops. This satisfies the {@link BlockCache#close()} contract.
      */
     @Override
     public void close() {
