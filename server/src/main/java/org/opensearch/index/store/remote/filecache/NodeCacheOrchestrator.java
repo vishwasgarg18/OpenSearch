@@ -15,6 +15,7 @@ import org.opensearch.OpenSearchException;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.plugins.BlockCache;
 import org.opensearch.plugins.BlockCacheProvider;
+import org.opensearch.plugins.BlockCacheRegistry;
 import org.opensearch.plugins.BlockCacheStats;
 import org.opensearch.common.SetOnce;
 import org.opensearch.common.annotation.ExperimentalApi;
@@ -50,7 +51,7 @@ import java.util.concurrent.ForkJoinTask;
  * @opensearch.experimental
  */
 @ExperimentalApi
-public class NodeCacheOrchestrator implements Closeable {
+public class NodeCacheOrchestrator implements Closeable, BlockCacheRegistry {
 
     private static final Logger logger = LogManager.getLogger(NodeCacheOrchestrator.class);
 
@@ -73,6 +74,11 @@ public class NodeCacheOrchestrator implements Closeable {
     private NodeCacheOrchestrator(FileCache fileCache, long virtualBlockCacheBytes) {
         this.fileCache = fileCache;
         this.virtualBlockCacheBytes = virtualBlockCacheBytes;
+    }
+
+    /** Package-private constructor for testing — creates an orchestrator with no block-cache budget. */
+    NodeCacheOrchestrator(FileCache fileCache) {
+        this(fileCache, 0L);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -206,7 +212,8 @@ public class NodeCacheOrchestrator implements Closeable {
         }
     }
 
-    private void addBlockCache(BlockCache blockCache) {
+    // Package-private for testing
+    void addBlockCache(BlockCache blockCache) {
         blockCaches.add(blockCache);
         logger.info("Block cache registered (disk bytes used so far: {})",
             new ByteSizeValue(blockCache.stats().diskBytesUsed()));
@@ -219,6 +226,13 @@ public class NodeCacheOrchestrator implements Closeable {
     /** Returns the {@link FileCache} instance. */
     public FileCache fileCache() {
         return fileCache;
+    }
+
+    @Override
+    public java.util.Optional<BlockCache> get(String name) {
+        return blockCaches.stream()
+            .filter(bc -> name.equals(bc.cacheName()))
+            .findFirst();
     }
 
     /** Returns a snapshot of all registered block caches. */

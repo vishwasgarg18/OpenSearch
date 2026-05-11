@@ -174,7 +174,7 @@ import org.opensearch.index.store.DefaultDataFormatAwareStoreDirectoryFactory;
 import org.opensearch.index.store.IndexStoreListener;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
 import org.opensearch.index.store.remote.filecache.FileCache;
-import org.opensearch.index.store.remote.filecache.FileCacheCleaner;
+import org.opensearch.index.store.remote.filecache.NodeCacheOrchestratorCleaner;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.index.store.remote.filecache.FileCacheSettings;
 import org.opensearch.index.store.remote.filecache.NodeCacheOrchestrator;
@@ -594,7 +594,8 @@ public class Node implements Closeable {
                 .map(IndexStorePlugin::getIndexStoreListener)
                 .filter(Optional::isPresent)
                 .map(Optional::get);
-            // FileCache is only initialized on warm nodes, so we only create FileCacheCleaner on warm nodes as well
+            // NodeCacheOrchestratorCleaner is only needed on warm nodes (where FileCache and
+            // BlockCaches are active). On hot nodes there is nothing to clean up.
             if (DiscoveryNode.isWarmNode(settings) == false) {
                 nodeEnvironment = new NodeEnvironment(
                     settings,
@@ -606,7 +607,7 @@ public class Node implements Closeable {
                     settings,
                     environment,
                     new IndexStoreListener.CompositeIndexStoreListener(
-                        Stream.concat(indexStoreListenerStream, Stream.of(new FileCacheCleaner(this::fileCache)))
+                        Stream.concat(indexStoreListenerStream, Stream.of(new NodeCacheOrchestratorCleaner(this.nodeCacheOrchestrator)))
                             .collect(Collectors.toList())
                     )
                 );
@@ -1066,7 +1067,7 @@ public class Node implements Closeable {
                 recoverySettings,
                 cacheService,
                 remoteStoreSettings,
-                fileCache(),
+                nodeCacheOrchestrator,
                 compositeIndexSettings,
                 segmentReplicator::startReplication,
                 segmentReplicator::getSegmentReplicationStats,
