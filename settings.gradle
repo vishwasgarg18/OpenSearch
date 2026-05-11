@@ -127,7 +127,7 @@ addSubProjects('', new File(rootProject.projectDir, 'libs'))
 addSubProjects('', new File(rootProject.projectDir, 'modules'))
 addSubProjects('', new File(rootProject.projectDir, 'plugins'))
 // Sandbox modules require JDK 25+. Include only when explicitly enabled via -Dsandbox.enabled=true.
-if (System.getProperty('sandbox.enabled', 'false') == 'true') {
+if (System.getProperty('sandbox.enabled', 'true') == 'true') {
   addSubProjects('', new File(rootProject.projectDir, 'sandbox'))
 }
 addSubProjects('', new File(rootProject.projectDir, 'qa'))

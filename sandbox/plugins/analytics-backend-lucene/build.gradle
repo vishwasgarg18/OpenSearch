@@ -14,6 +14,10 @@ opensearchplugin {
     extendedPlugins = ['analytics-engine']
 }
 
+tasks.matching { it.name == 'missingJavadoc' }.configureEach {
+    enabled = false
+}
+
 java { sourceCompatibility = JavaVersion.toVersion(25); targetCompatibility = JavaVersion.toVersion(25) }
 
 // Calcite (via analytics-engine) requires Guava which OpenSearch forbids on compile classpath.

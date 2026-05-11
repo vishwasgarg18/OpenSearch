@@ -94,6 +94,7 @@ public class TieredDirectory extends CompositeDirectory {
 
     @Override
     public void deleteFile(String name) throws IOException {
+        logger.info("[TieredDir] deleteFile file={}", name);
         super.deleteFile(name);
         // If entry doesn't exist, remove will be a NoOp
         fileCache.remove(getFilePathSwitchable(localDirectory, name));
@@ -129,6 +130,7 @@ public class TieredDirectory extends CompositeDirectory {
     @Override
     public IndexInput openInput(String name, IOContext context) throws IOException {
         ensureOpen();
+        logger.info("[TieredDir] openInput file={}", name);
         // We aren't tracking temporary files (created via createTempOutput) currently in FileCache as these are created and then deleted
         // within a very short span of time
         // We will be reading them directory from the local directory
@@ -163,6 +165,7 @@ public class TieredDirectory extends CompositeDirectory {
 
     @Override
     public void afterSyncToRemote(String file) {
+        logger.info("[TieredDir] afterSyncToRemote file={}", file);
         super.afterSyncToRemote(file);
 
         // once file is uploaded to remote, we can decrement the ref count of the switchable entry in file cache

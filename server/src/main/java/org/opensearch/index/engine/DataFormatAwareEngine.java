@@ -488,6 +488,10 @@ public class DataFormatAwareEngine implements Indexer {
      */
     @Override
     public Engine.IndexResult index(Engine.Index index) throws IOException {
+        // Block indexing on warm — read-only until we have a proper read-only engine
+        if (engineConfig.getIndexSettings().isWarmIndex()) {
+            throw new UnsupportedOperationException("Indexing is not supported on warm indices");
+        }
         assert Objects.equals(index.uid().field(), IdFieldMapper.NAME) : index.uid().field();
         assert (index.origin() == Engine.Operation.Origin.PRIMARY
             || index.origin() == Engine.Operation.Origin.LOCAL_TRANSLOG_RECOVERY
@@ -849,6 +853,10 @@ public class DataFormatAwareEngine implements Indexer {
      */
     @Override
     public void flush(boolean force, boolean waitIfOngoing) throws EngineException {
+        // Skip flushing for warm indices — read-only, no local commits
+        if (engineConfig.getIndexSettings().isWarmIndex()) {
+            return;
+        }
         ensureOpen();
         if (force && waitIfOngoing == false) {
             throw new IllegalArgumentException(
@@ -970,6 +978,10 @@ public class DataFormatAwareEngine implements Indexer {
         boolean upgradeOnlyAncientSegments,
         String forceMergeUUID
     ) throws EngineException, IOException {
+        // Block merges on warm — read-only, no segment mutations
+        if (engineConfig.getIndexSettings().isWarmIndex()) {
+            return;
+        }
         mergeScheduler.forceMerge(1);
     }
 
