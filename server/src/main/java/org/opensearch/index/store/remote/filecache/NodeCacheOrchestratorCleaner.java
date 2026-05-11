@@ -11,7 +11,6 @@ package org.opensearch.index.store.remote.filecache;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
-import org.opensearch.common.inject.Provider;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
@@ -19,6 +18,7 @@ import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.IndexStoreListener;
+import org.opensearch.plugins.BlockCache;
 
 import java.io.IOException;
 import java.nio.file.DirectoryStream;
@@ -29,59 +29,61 @@ import static org.opensearch.index.store.remote.directory.RemoteSnapshotDirector
 import static org.opensearch.index.store.remote.utils.FileTypeUtils.INDICES_FOLDER_IDENTIFIER;
 
 /**
- * IndexStoreListener to clean up file cache when the index is deleted. The cached entries will be eligible
- * for eviction when the shard is deleted, but this listener deterministically removes entries from memory and
- * from disk at the time of shard deletion as opposed to waiting for the cache to need to perform eviction.
+ * IndexStoreListener that cleans up all node-level caches when a shard or index is
+ * deleted. Handles both the {@link FileCache} (Lucene LRU block-file cache) and any
+ * registered {@link BlockCache} instances (e.g. Foyer byte-range cache).
+ *
+ * <p>Cleanup is deterministic — entries are removed at deletion time rather than
+ * waiting for natural LRU eviction pressure.
  *
  * @opensearch.internal
  */
-public class FileCacheCleaner implements IndexStoreListener {
-    private static final Logger logger = LogManager.getLogger(FileCacheCleaner.class);
+public class NodeCacheOrchestratorCleaner implements IndexStoreListener {
 
-    private final Provider<FileCache> fileCacheProvider;
+    private static final Logger logger = LogManager.getLogger(NodeCacheOrchestratorCleaner.class);
 
-    public FileCacheCleaner(Provider<FileCache> fileCacheProvider) {
-        this.fileCacheProvider = fileCacheProvider;
+    private final NodeCacheOrchestrator nodeCacheOrchestrator;
+
+    public NodeCacheOrchestratorCleaner(NodeCacheOrchestrator nodeCacheOrchestrator) {
+        this.nodeCacheOrchestrator = nodeCacheOrchestrator;
     }
 
     /**
-     * before shard path deleted, cleans up the corresponding index file path entries from FC and delete the corresponding shard file
-     * cache path.
-     *
-     * @param shardId  the shard id
-     * @param indexSettings the index settings
-     * @param nodeEnvironment the node environment
+     * Before the shard path is deleted, removes all cache entries for that shard
+     * from the FileCache and all registered block caches, then deletes the shard's
+     * cache directory from disk.
      */
     @Override
     public void beforeShardPathDeleted(ShardId shardId, IndexSettings indexSettings, NodeEnvironment nodeEnvironment) {
         if (indexSettings.isRemoteSnapshot()) {
             final ShardPath shardPath = ShardPath.loadFileCachePath(nodeEnvironment, shardId);
-            cleanupShardFileCache(shardPath, false, true);
+            cleanupShardCaches(shardPath, false, true);
             deleteShardFileCacheDirectory(shardPath);
         } else if (indexSettings.isWarmIndex()) {
             try {
                 final ShardPath shardPath = ShardPath.loadShardPath(logger, nodeEnvironment, shardId, indexSettings.customDataPath());
                 if (shardPath != null) {
-                    cleanupShardFileCache(shardPath, true, false);
+                    cleanupShardCaches(shardPath, true, false);
                     deleteShardFileCacheDirectory(shardPath);
                 }
             } catch (IOException e) {
-                logger.error("failed to delete warm index shard file cache directory", e);
+                logger.error("failed to clean up shard cache directory", e);
             }
         }
     }
 
     /**
-     * Cleans up the corresponding index file path entries from FileCache
+     * Removes all cache entries for the given shard from all node-level caches.
      *
-     * @param isWarmIndex flag indicating if this is a remote index
-     * @param isRemoteSnapshot flag indicating if this is a remote snapshot
+     * <p>FileCache entries are removed by iterating the shard's local store path.
+     * BlockCache entries are evicted by prefix (the shard's data path), which removes
+     * all byte-range keys for every file that belonged to this shard.
      */
-    private void cleanupShardFileCache(ShardPath shardPath, boolean isWarmIndex, boolean isRemoteSnapshot) {
-        try {
-            final FileCache fc = fileCacheProvider.get();
-            assert fc != null;
+    private void cleanupShardCaches(ShardPath shardPath, boolean isWarmIndex, boolean isRemoteSnapshot) {
+        assert this.nodeCacheOrchestrator != null;
 
+        // ── FileCache (Lucene LRU block-file cache) ───────────────────────────
+        try {
             final Path localStorePath;
             if (isWarmIndex) {
                 localStorePath = shardPath.getDataPath().resolve(INDICES_FOLDER_IDENTIFIER);
@@ -93,24 +95,35 @@ public class FileCacheCleaner implements IndexStoreListener {
 
             try (DirectoryStream<Path> ds = Files.newDirectoryStream(localStorePath)) {
                 for (Path subPath : ds) {
-                    fc.remove(subPath.toRealPath());
+                    this.nodeCacheOrchestrator.fileCache().remove(subPath.toRealPath());
                 }
             }
         } catch (IOException ioe) {
             String operationType = isWarmIndex ? "warm index" : "remote snapshot";
             logger.error(
                 () -> new ParameterizedMessage(
-                    "Error removing items from cache during {} shard deletion {}",
+                    "Error removing FileCache entries during {} shard deletion {}",
                     operationType,
                     shardPath.getShardId()
                 ),
                 ioe
             );
         }
+
+        // ── BlockCaches (byte-range cache, e.g. Foyer) ───────────────────────
+        // Evict all byte-range entries whose key is prefixed with this shard's data
+        // path. On warm nodes this covers all Parquet column-chunk ranges cached
+        // for this shard; no-op on hot nodes (blockCaches list is empty).
+        if (isWarmIndex && !this.nodeCacheOrchestrator.blockCaches().isEmpty()) {
+            final String prefix = shardPath.getDataPath().toString();
+            for (BlockCache cache : this.nodeCacheOrchestrator.blockCaches()) {
+                cache.evictPrefix(prefix);
+            }
+        }
     }
 
     private void deleteShardFileCacheDirectory(ShardPath shardPath) {
-        final Path path = shardPath.getDataPath();
+        final Path path  = shardPath.getDataPath();
         try {
             if (Files.exists(path)) {
                 IOUtils.rm(path);
@@ -121,11 +134,9 @@ public class FileCacheCleaner implements IndexStoreListener {
     }
 
     /**
-     * before index path deleted, delete the corresponding index file cache path.
-     *
-     * @param index  the index
-     * @param indexSettings the index settings
-     * @param nodeEnvironment the node environment
+     * Before the index path is deleted, removes the index-level cache directory from
+     * disk. At this point all per-shard caches have already been cleaned up in
+     * {@link #beforeShardPathDeleted}.
      */
     @Override
     public void beforeIndexPathDeleted(Index index, IndexSettings indexSettings, NodeEnvironment nodeEnvironment) {
@@ -145,6 +156,17 @@ public class FileCacheCleaner implements IndexStoreListener {
                     IOUtils.rm(indicesPathInCache);
                 } catch (IOException e) {
                     logger.error(() -> new ParameterizedMessage("Failed to delete indices path in cache for index {}", index), e);
+                }
+            }
+
+            // Defensively evict all block cache entries for this index.
+            // beforeShardPathDeleted evicts per-shard, but this catches any stragglers
+            // if a shard was absent or deletion was partial.
+            // Keys are prefixed with the absolute shard data path under indicesPath/{uuid}.
+            if (this.nodeCacheOrchestrator != null && !this.nodeCacheOrchestrator.blockCaches().isEmpty()) {
+                final String indexPrefix = indicesPathInCache.toString();
+                for (BlockCache cache : this.nodeCacheOrchestrator.blockCaches()) {
+                    cache.evictPrefix(indexPrefix);
                 }
             }
         }

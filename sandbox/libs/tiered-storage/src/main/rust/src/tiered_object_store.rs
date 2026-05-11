@@ -7,11 +7,15 @@
  */
 
 //! [`TieredObjectStore`] — routes reads between local and remote stores
-//! based on [`TieredStorageRegistry`] metadata.
+//! based on [`TieredStorageRegistry`] metadata, with an optional block cache.
 //!
 //! On every read, it checks the file registry:
 //! - **Remote** → delegates to the store-level remote backend
 //! - **Local / Both / not registered** → falls through to the local store
+//!
+//! When a [`BlockCache`] is attached via [`TieredObjectStore::with_cache`],
+//! `get_range` and `get_ranges` consult it first and populate it on misses.
+//! Cache entries are evicted on file deletion via [`ObjectStore::delete_stream`].
 //!
 //! # Thread Safety
 //!
@@ -19,15 +23,20 @@
 //! registry's atomics and DashMap — no locks are held during I/O.
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use object_store::{
     path::Path, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
+
+use opensearch_block_cache::range_cache::range_cache_key;
+use opensearch_block_cache::traits::BlockCache;
 
 use crate::registry::traits::FileRegistry;
 use crate::registry::TieredStorageRegistry;
@@ -42,14 +51,20 @@ use crate::types::{FileLocation, TieredFileEntry};
 ///
 /// Per-shard model: one remote store is set once via [`set_remote()`] and
 /// shared across all entries.
+///
+/// An optional node-level [`BlockCache`] can be attached via [`with_cache()`]
+/// to accelerate warm-shard reads. The cache is shared across all shards.
 pub struct TieredObjectStore {
     registry: Arc<TieredStorageRegistry>,
     local: Arc<dyn ObjectStore>,
     remote: std::sync::OnceLock<Arc<dyn ObjectStore>>,
+    /// Optional node-level block cache. `None` on hot nodes or when disabled.
+    cache: Option<Arc<dyn BlockCache>>,
 }
 
 impl TieredObjectStore {
     /// Create a new tiered store routing between `local` and remote backends.
+    /// No block cache is attached; call [`with_cache`] to attach one.
     #[must_use]
     pub fn new(registry: Arc<TieredStorageRegistry>, local: Arc<dyn ObjectStore>) -> Self {
         native_bridge_common::log_info!("TieredObjectStore: created");
@@ -57,6 +72,7 @@ impl TieredObjectStore {
             registry,
             local,
             remote: std::sync::OnceLock::new(),
+            cache: None,
         }
     }
 
@@ -69,6 +85,21 @@ impl TieredObjectStore {
     /// Set the remote store (once). Subsequent calls are ignored.
     pub fn set_remote(&self, store: Arc<dyn ObjectStore>) {
         self.remote.set(store).ok(); // ignore if already set
+    }
+
+    /// Attach a node-level block cache for warm-shard read acceleration.
+    ///
+    /// Must be called once at shard creation, before any I/O. The provided
+    /// `Arc` is cloned — the caller's reference is not consumed.
+    ///
+    /// Returns `self` for builder-style use:
+    /// ```ignore
+    /// let store = TieredObjectStore::new(registry, local).with_cache(cache_arc);
+    /// ```
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<dyn BlockCache>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Register a file in the registry. For Remote/Both locations, the caller
@@ -210,19 +241,37 @@ impl TieredObjectStore {
         }
         None
     }
+
+    // ── Cache helpers ─────────────────────────────────────────────────────────
+
+    /// Evict all cached byte-range entries for `path`.
+    ///
+    /// Called from [`ObjectStore::delete_stream`] to prevent stale data from
+    /// being served after a file is removed from the registry. No-op if no
+    /// cache is attached.
+    fn cache_evict(&self, path: &str) {
+        if let Some(ref cache) = self.cache {
+            cache.evict_prefix(path);
+            native_bridge_common::log_debug!(
+                "TieredObjectStore: cache_evict path='{}'",
+                path
+            );
+        }
+    }
 }
 
 impl fmt::Debug for TieredObjectStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TieredObjectStore")
             .field("file_count", &self.registry.len())
+            .field("cache", &self.cache.is_some())
             .finish()
     }
 }
 
 impl fmt::Display for TieredObjectStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "TieredObjectStore(files={})", self.registry.len())
+        write!(f, "TieredObjectStore(files={}, cache={})", self.registry.len(), self.cache.is_some())
     }
 }
 
@@ -296,16 +345,156 @@ impl ObjectStore for TieredObjectStore {
         result
     }
 
-    /// Delete stream: remove each path from registry only, NO local delete.
+    /// Range read with cache-first routing.
+    ///
+    /// # Read path
+    /// 1. **Cache probe**: if a [`BlockCache`] is attached, check it first.
+    ///    A hit returns immediately — zero local/remote I/O.
+    /// 2. **Route**: registry → remote store, or local store with retry-remote.
+    /// 3. **Cache populate**: on a successful I/O, insert the result so the
+    ///    next identical read hits the cache.
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> OsResult<Bytes> {
+        let path_str = location.as_ref();
+        let start = range.start;
+        let end   = range.end;
+
+        // ── Step 1: Cache probe ───────────────────────────────────────────
+        if let Some(ref cache) = self.cache {
+            let key = range_cache_key(path_str, start, end);
+            if let Some(cached) = cache.get(&key).await {
+                native_bridge_common::log_debug!(
+                    "TieredObjectStore: get_range CACHE HIT path='{}' {}..{}",
+                    path_str, start, end
+                );
+                return Ok(cached);
+            }
+        }
+
+        // ── Step 2: Route to remote or local ─────────────────────────────
+        let result = if let Some((rp, store)) = self.resolve_remote(path_str) {
+            store.get_range(&rp, range.clone()).await
+        } else {
+            let r = self.local.get_range(location, range.clone()).await;
+            if let Err(ref e) = r {
+                if let Some((rp, store)) = self.should_retry_remote(path_str, e) {
+                    store.get_range(&rp, range.clone()).await
+                } else {
+                    r
+                }
+            } else {
+                r
+            }
+        };
+
+        // ── Step 3: Populate cache on success ─────────────────────────────
+        // `put` is best-effort — a cache write failure must never fail the read.
+        if let (Ok(ref bytes), Some(ref cache)) = (&result, &self.cache) {
+            let key = range_cache_key(path_str, start, end);
+            cache.put(&key, bytes.clone());
+            native_bridge_common::log_debug!(
+                "TieredObjectStore: get_range CACHE MISS populated path='{}' {}..{} len={}",
+                path_str, start, end, bytes.len()
+            );
+        }
+
+        result
+    }
+
+    /// Multi-range read with per-range cache probing.
+    ///
+    /// # Read path
+    /// 1. **Per-range cache probe**: split ranges into hits and misses.
+    ///    If all ranges hit, return immediately — zero I/O.
+    /// 2. **Batch fetch** only the missed ranges from remote/local.
+    /// 3. **Splice + cache populate**: insert fetched bytes and stitch the
+    ///    full result slice in original order.
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OsResult<Vec<Bytes>> {
+        let path_str = location.as_ref();
+
+        // ── Step 1: Per-range cache probe ─────────────────────────────────
+        // slots[i] = Some(bytes) for a cache hit, None for a miss.
+        let mut slots: Vec<Option<Bytes>> = Vec::with_capacity(ranges.len());
+        let mut miss_indices: Vec<usize> = Vec::new();
+        let mut miss_ranges: Vec<Range<u64>> = Vec::new();
+
+        if let Some(ref cache) = self.cache {
+            for (i, r) in ranges.iter().enumerate() {
+                let key = range_cache_key(path_str, r.start, r.end);
+                if let Some(cached) = cache.get(&key).await {
+                    slots.push(Some(cached));
+                } else {
+                    slots.push(None);
+                    miss_indices.push(i);
+                    miss_ranges.push(r.clone());
+                }
+            }
+            // Full cache hit — skip all I/O.
+            if miss_ranges.is_empty() {
+                native_bridge_common::log_debug!(
+                    "TieredObjectStore: get_ranges FULL CACHE HIT path='{}' n={}",
+                    path_str, ranges.len()
+                );
+                return Ok(slots.into_iter().map(|o| o.unwrap()).collect());
+            }
+        } else {
+            // No cache — all ranges are misses.
+            for (i, r) in ranges.iter().enumerate() {
+                slots.push(None);
+                miss_indices.push(i);
+                miss_ranges.push(r.clone());
+            }
+        }
+
+        // ── Step 2: Fetch only missed ranges ──────────────────────────────
+        let fetched = if let Some((rp, store)) = self.resolve_remote(path_str) {
+            store.get_ranges(&rp, &miss_ranges).await?
+        } else {
+            let r = self.local.get_ranges(location, &miss_ranges).await;
+            match r {
+                Ok(b) => b,
+                Err(ref e) => {
+                    if let Some((rp, store)) = self.should_retry_remote(path_str, e) {
+                        store.get_ranges(&rp, &miss_ranges).await?
+                    } else {
+                        r?
+                    }
+                }
+            }
+        };
+
+        // ── Step 3: Populate cache and stitch results ─────────────────────
+        if let Some(ref cache) = self.cache {
+            for (fetched_bytes, (&slot_i, miss_range)) in
+                fetched.iter().zip(miss_indices.iter().zip(miss_ranges.iter()))
+            {
+                let key = range_cache_key(path_str, miss_range.start, miss_range.end);
+                cache.put(&key, fetched_bytes.clone());
+                slots[slot_i] = Some(fetched_bytes.clone());
+            }
+        } else {
+            for (fetched_bytes, &slot_i) in fetched.iter().zip(miss_indices.iter()) {
+                slots[slot_i] = Some(fetched_bytes.clone());
+            }
+        }
+
+        Ok(slots.into_iter().map(|o| o.unwrap()).collect())
+    }
+
+    /// Delete stream: remove each path from registry and evict its cache entries.
     /// Local file deletion is handled by the Java layer.
     fn delete_stream(
         &self,
         locations: BoxStream<'static, OsResult<Path>>,
     ) -> BoxStream<'static, OsResult<Path>> {
         let registry = Arc::clone(&self.registry);
+        let cache = self.cache.clone();
         let mapped = locations.map(move |result| {
             if let Ok(ref path) = result {
-                registry.remove(path.as_ref(), true);
+                let path_str = path.as_ref();
+                registry.remove(path_str, true);
+                if let Some(ref c) = cache {
+                    c.evict_prefix(path_str);
+                }
             }
             result
         });
