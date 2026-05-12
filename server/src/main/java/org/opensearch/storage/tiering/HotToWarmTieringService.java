@@ -8,13 +8,20 @@
 
 package org.opensearch.storage.tiering;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterInfoService;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.ClusterStateUpdateTask;
+import org.opensearch.cluster.block.ClusterBlocks;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.routing.allocation.AllocationService;
 import org.opensearch.cluster.routing.allocation.DiskThresholdEvaluator;
 import org.opensearch.cluster.routing.allocation.WarmNodeDiskThresholdEvaluator;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.Priority;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
@@ -39,9 +46,16 @@ import static org.opensearch.storage.common.tiering.TieringUtils.H2W_TIERING_STA
 import static org.opensearch.storage.common.tiering.TieringUtils.TIERED_COMPOSITE_INDEX_TYPE;
 
 /**
- * Service responsible for tiering indices from hot to warm.
+ * Service responsible for tiering indices from the hot tier to the warm tier.
+ *
+ * <p>In addition to the standard tiering lifecycle inherited from {@link TieringService},
+ * this service applies warm-specific index settings at migration start and recovers
+ * any write blocks that were left orphaned by a cluster-manager failure during a
+ * pre-migration segment upload.
  */
 public class HotToWarmTieringService extends TieringService {
+
+    private static final Logger logger = LogManager.getLogger(HotToWarmTieringService.class);
 
     /**
      * Disk Threshold Evaluator
@@ -119,6 +133,10 @@ public class HotToWarmTieringService extends TieringService {
             .put(IS_WARM_INDEX_SETTING.getKey(), true)
             .put(INDEX_TIERING_STATE.getKey(), HOT_TO_WARM)
             .put(INDEX_COMPOSITE_STORE_TYPE_SETTING.getKey(), TIERED_COMPOSITE_INDEX_TYPE)
+            // Warm indexes have a fixed replica count; prevent auto-expansion matching node count.
+            .put(org.opensearch.cluster.metadata.AutoExpandReplicas.SETTING.getKey(), false)
+            // Warm indexes are sealed after migration; periodic refresh serves no purpose.
+            .put(org.opensearch.index.IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey(), -1)
             .build();
     }
 
@@ -128,6 +146,8 @@ public class HotToWarmTieringService extends TieringService {
             .put(IS_WARM_INDEX_SETTING.getKey(), false)
             .put(INDEX_TIERING_STATE.getKey(), HOT)
             .put(INDEX_COMPOSITE_STORE_TYPE_SETTING.getKey(), "default")
+            .putNull(org.opensearch.cluster.metadata.AutoExpandReplicas.SETTING.getKey())
+            .putNull(org.opensearch.index.IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey())
             .build();
     }
 
@@ -158,5 +178,87 @@ public class HotToWarmTieringService extends TieringService {
      */
     private void setFileCacheActiveUsageThreshold(Integer fileCacheActiveUsageThreshold) {
         this.fileCacheActiveUsageThresholdPercent = fileCacheActiveUsageThreshold;
+    }
+
+    /**
+     * Extends the base cluster-change handler to recover write blocks orphaned by a
+     * cluster-manager failure.
+     *
+     * <p>When the pre-migration shard sync
+     * ({@link org.opensearch.storage.action.tiering.TransportWarmTierPreSyncAction})
+     * is in flight, an index-level write block is held. If the cluster-manager dies before
+     * calling {@link #tier}, the block persists in cluster state with the index still at
+     * tiering state {@code HOT}. On the next master election this method detects and
+     * removes such orphaned blocks so the index becomes writable again.
+     */
+    @Override
+    public void clusterChanged(ClusterChangedEvent event) {
+        super.clusterChanged(event);
+
+        if (event.localNodeClusterManager()
+            && event.previousState().nodes().isLocalNodeElectedClusterManager() == false) {
+            recoverStuckPreTierWriteBlocks(event.state());
+        }
+    }
+
+    /**
+     * Scans all indices for orphaned write blocks: an index has
+     * {@link IndexMetadata#INDEX_READ_ONLY_ALLOW_DELETE_BLOCK} applied but its
+     * {@code INDEX_TIERING_STATE} is still {@link IndexModule.TieringState#HOT}.
+     *
+     * <p>This condition arises when the cluster-manager failed after applying the block
+     * during pre-migration but before the tiering cluster state update ran. No migration
+     * state was ever persisted, so the block is safe to remove unconditionally.
+     */
+    private void recoverStuckPreTierWriteBlocks(ClusterState state) {
+        for (IndexMetadata indexMetadata : state.metadata().indices().values()) {
+            final String indexName = indexMetadata.getIndex().getName();
+            if (state.blocks().hasIndexBlock(indexName, IndexMetadata.INDEX_READ_ONLY_ALLOW_DELETE_BLOCK)) {
+                final String tieringStateStr = indexMetadata.getSettings().get(INDEX_TIERING_STATE.getKey());
+                if (HOT.toString().equals(tieringStateStr)) {
+                    logger.warn(
+                        "Detected orphaned write block on index [{}] with tiering state HOT; removing.",
+                        indexName
+                    );
+                    removeWriteBlock(indexName);
+                }
+            }
+        }
+    }
+
+    /**
+     * Submits an urgent cluster state update to remove a write block from the given index.
+     * Used both for orphaned-block recovery on master election and for explicit cleanup on
+     * pre-migration failure.
+     *
+     * <p>When called from failure cleanup the tiering state will still be {@code HOT}
+     * so the re-check is a safe guard rather than a filter.
+     */
+    public void removeWriteBlock(String index) {
+        clusterService.submitStateUpdateTask(
+            "recover-stuck-pre-warm-tier-write-block[" + index + "]",
+            new ClusterStateUpdateTask(Priority.URGENT) {
+                @Override
+                public ClusterState execute(ClusterState currentState) {
+                    final IndexMetadata meta = currentState.metadata().index(index);
+                    if (meta == null) {
+                        return currentState;
+                    }
+                    final String tieringState = meta.getSettings().get(INDEX_TIERING_STATE.getKey());
+                    // Guard: tiering may have started on another node between detection and execution.
+                    if (!HOT.toString().equals(tieringState)) {
+                        return currentState;
+                    }
+                    final ClusterBlocks.Builder blocks = ClusterBlocks.builder().blocks(currentState.blocks());
+                    blocks.removeIndexBlockWithId(index, IndexMetadata.INDEX_READ_ONLY_ALLOW_DELETE_BLOCK.id());
+                    return ClusterState.builder(currentState).blocks(blocks).build();
+                }
+
+                @Override
+                public void onFailure(String source, Exception e) {
+                    logger.warn("Failed to remove orphaned write block from index [{}]", index, e);
+                }
+            }
+        );
     }
 }

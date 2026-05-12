@@ -38,6 +38,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import org.opensearch.cluster.metadata.AutoExpandReplicas;
+import org.opensearch.index.IndexSettings;
+
 import static org.opensearch.common.settings.ClusterSettings.BUILT_IN_CLUSTER_SETTINGS;
 import static org.opensearch.index.IndexModule.INDEX_COMPOSITE_STORE_TYPE_SETTING;
 import static org.opensearch.index.IndexModule.INDEX_TIERING_STATE;
@@ -116,6 +119,8 @@ public class WarmToHotTieringServiceTests extends OpenSearchTestCase {
         assertEquals("false", settings.get(IS_WARM_INDEX_SETTING.getKey()));
         assertEquals(WARM_TO_HOT.toString(), settings.get(INDEX_TIERING_STATE.getKey()));
         assertEquals("default", settings.get(INDEX_COMPOSITE_STORE_TYPE_SETTING.getKey()));
+        assertNull(settings.get(AutoExpandReplicas.SETTING.getKey()));
+        assertNull(settings.get(IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey()));
     }
 
     public void testGetIndexTierSettingsToRestoreAfterCancellation() {
@@ -123,6 +128,20 @@ public class WarmToHotTieringServiceTests extends OpenSearchTestCase {
         assertEquals("true", settings.get(IS_WARM_INDEX_SETTING.getKey()));
         assertEquals(TieringState.WARM.toString(), settings.get(INDEX_TIERING_STATE.getKey()));
         assertEquals(TIERED_COMPOSITE_INDEX_TYPE, settings.get(INDEX_COMPOSITE_STORE_TYPE_SETTING.getKey()));
+        assertEquals("false", settings.get(AutoExpandReplicas.SETTING.getKey()));
+        assertEquals("-1", settings.get(IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey()));
+    }
+
+    public void testBuildClusterBlocksRemovesWriteBlock() {
+        String indexName = "test-index";
+        org.opensearch.cluster.block.ClusterBlocks blocksWithWriteBlock = org.opensearch.cluster.block.ClusterBlocks.builder()
+            .addIndexBlock(indexName, IndexMetadata.INDEX_READ_ONLY_ALLOW_DELETE_BLOCK)
+            .build();
+        org.opensearch.core.index.Index index = new org.opensearch.core.index.Index(indexName, "_na_");
+
+        org.opensearch.cluster.block.ClusterBlocks result = service.buildClusterBlocks(blocksWithWriteBlock, index);
+
+        assertFalse(result.hasIndexBlock(indexName, IndexMetadata.INDEX_READ_ONLY_ALLOW_DELETE_BLOCK));
     }
 
     public void testGetTieringStartTimeKey() {

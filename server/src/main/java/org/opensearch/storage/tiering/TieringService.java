@@ -18,6 +18,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateListener;
 import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.ack.ClusterStateUpdateResponse;
+import org.opensearch.cluster.block.ClusterBlocks;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
@@ -421,6 +422,14 @@ public abstract class TieringService implements ClusterStateListener {
     }
 
     /**
+     * Optionally modifies cluster blocks in the same transaction as {@link #tier}.
+     * Subclasses may override to add or remove index-level blocks atomically.
+     */
+    protected ClusterBlocks buildClusterBlocks(final ClusterBlocks currentBlocks, final Index index) {
+        return currentBlocks;
+    }
+
+    /**
      * Checks if the given index is currently being tiered.
      * @param index the index to check
      * @return true if the index is being tiered
@@ -475,6 +484,7 @@ public abstract class TieringService implements ClusterStateListener {
                     ClusterState updatedState = ClusterState.builder(currentState)
                         .metadata(metadataBuilder)
                         .routingTable(routingTableBuilder.build())
+                        .blocks(buildClusterBlocks(currentState.blocks(), index))
                         .build();
 
                     // now, reroute to trigger shard relocation

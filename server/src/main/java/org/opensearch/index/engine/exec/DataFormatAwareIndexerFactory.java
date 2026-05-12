@@ -11,11 +11,16 @@ package org.opensearch.index.engine.exec;
 import org.opensearch.index.engine.DataFormatAwareEngine;
 import org.opensearch.index.engine.DataFormatAwareNRTReplicationEngine;
 import org.opensearch.index.engine.EngineConfig;
+import org.opensearch.index.engine.ReadOnlyDataFormatAwareEngine;
 
 /**
- * {@link IndexerFactory} that creates a {@link DataFormatAwareEngine} for primaries
- * or a {@link DataFormatAwareNRTReplicationEngine} for read-only replicas,
- * used when the pluggable data format feature is enabled.
+ * {@link IndexerFactory} that selects the correct {@link Indexer} for pluggable-dataformat shards.
+ *
+ * <ul>
+ *   <li>Segment-replication replica → {@link DataFormatAwareNRTReplicationEngine}</li>
+ *   <li>Warm primary (isWarmIndex + dataFormatRegistry present) → {@link ReadOnlyDataFormatAwareEngine}</li>
+ *   <li>Hot primary → {@link DataFormatAwareEngine}</li>
+ * </ul>
  *
  * @opensearch.internal
  */
@@ -26,6 +31,11 @@ public class DataFormatAwareIndexerFactory implements IndexerFactory {
         if (config.isReadOnlyReplica()) {
             return new DataFormatAwareNRTReplicationEngine(config);
         }
+
+        if (config.getIndexSettings().isWarmIndex() && config.getDataFormatRegistry() != null) {
+            return new ReadOnlyDataFormatAwareEngine(config);
+        }
+
         return new DataFormatAwareEngine(config);
     }
 }

@@ -10,6 +10,9 @@ package org.opensearch.storage.tiering;
 
 import org.opensearch.cluster.ClusterInfoService;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.block.ClusterBlocks;
+import org.opensearch.cluster.metadata.AutoExpandReplicas;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.routing.allocation.AllocationService;
 import org.opensearch.cluster.service.ClusterService;
@@ -19,6 +22,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.IndexModule;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.indices.ShardLimitValidator;
 
 import java.util.Set;
@@ -96,6 +100,11 @@ public class WarmToHotTieringService extends TieringService {
             .put(IS_WARM_INDEX_SETTING.getKey(), false)
             .put(INDEX_TIERING_STATE.getKey(), WARM_TO_HOT)
             .put(INDEX_COMPOSITE_STORE_TYPE_SETTING.getKey(), "default")
+            // Remove the warm-tier overrides so the index falls back to system defaults
+            // (refresh_interval → 1s, auto_expand_replicas → false). Original user-configured
+            // values set before hot-to-warm migration are not restored (pre-existing limitation).
+            .putNull(AutoExpandReplicas.SETTING.getKey())
+            .putNull(IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey())
             .build();
     }
 
@@ -105,6 +114,10 @@ public class WarmToHotTieringService extends TieringService {
             .put(IS_WARM_INDEX_SETTING.getKey(), true)
             .put(INDEX_TIERING_STATE.getKey(), WARM)
             .put(INDEX_COMPOSITE_STORE_TYPE_SETTING.getKey(), TIERED_COMPOSITE_INDEX_TYPE)
+            // Re-apply warm-specific overrides if migration is cancelled and the
+            // index reverts to warm state.
+            .put(AutoExpandReplicas.SETTING.getKey(), false)
+            .put(IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey(), -1)
             .build();
     }
 
@@ -126,5 +139,19 @@ public class WarmToHotTieringService extends TieringService {
     @Override
     protected IndexModule.TieringState getTieringType() {
         return WARM_TO_HOT;
+    }
+
+    /**
+     * Removes {@link IndexMetadata#INDEX_READ_ONLY_ALLOW_DELETE_BLOCK} in the same cluster state
+     * transaction that sets {@code IS_WARM_INDEX=false}. Shards are still on warm nodes at this
+     * point so the engine rejects writes; removing the block here avoids leaving the hot index
+     * permanently write-blocked after migration.
+     */
+    @Override
+    protected ClusterBlocks buildClusterBlocks(final ClusterBlocks currentBlocks, final Index index) {
+        return ClusterBlocks.builder()
+            .blocks(currentBlocks)
+            .removeIndexBlockWithId(index.getName(), IndexMetadata.INDEX_READ_ONLY_ALLOW_DELETE_BLOCK.id())
+            .build();
     }
 }

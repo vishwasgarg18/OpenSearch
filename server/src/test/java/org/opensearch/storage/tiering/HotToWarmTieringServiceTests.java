@@ -8,9 +8,15 @@
 
 package org.opensearch.storage.tiering;
 
+import org.opensearch.Version;
 import org.opensearch.cluster.ClusterInfoService;
+import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.ClusterStateUpdateTask;
+import org.opensearch.cluster.block.ClusterBlocks;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -21,6 +27,7 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.env.NodeEnvironment;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.indices.ShardLimitValidator;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.Before;
@@ -28,11 +35,14 @@ import org.junit.Before;
 import java.util.HashSet;
 import java.util.Set;
 
+import org.mockito.ArgumentCaptor;
+
 import static org.opensearch.common.settings.ClusterSettings.BUILT_IN_CLUSTER_SETTINGS;
 import static org.opensearch.index.IndexModule.INDEX_COMPOSITE_STORE_TYPE_SETTING;
 import static org.opensearch.index.IndexModule.INDEX_TIERING_STATE;
 import static org.opensearch.index.IndexModule.IS_WARM_INDEX_SETTING;
 import static org.opensearch.index.IndexModule.TieringState;
+import static org.opensearch.index.IndexModule.TieringState.HOT;
 import static org.opensearch.index.IndexModule.TieringState.HOT_TO_WARM;
 import static org.opensearch.index.store.remote.filecache.FileCacheSettings.DATA_TO_FILE_CACHE_SIZE_RATIO_SETTING;
 import static org.opensearch.storage.common.tiering.TieringUtils.FILECACHE_ACTIVE_USAGE_TIERING_THRESHOLD_PERCENT;
@@ -41,7 +51,9 @@ import static org.opensearch.storage.common.tiering.TieringUtils.H2W_MAX_CONCURR
 import static org.opensearch.storage.common.tiering.TieringUtils.H2W_TIERING_START_TIME_KEY;
 import static org.opensearch.storage.common.tiering.TieringUtils.JVM_USAGE_TIERING_THRESHOLD_PERCENT;
 import static org.opensearch.storage.common.tiering.TieringUtils.TIERED_COMPOSITE_INDEX_TYPE;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 public class HotToWarmTieringServiceTests extends OpenSearchTestCase {
@@ -95,13 +107,9 @@ public class HotToWarmTieringServiceTests extends OpenSearchTestCase {
         assertEquals("true", settings.get(IS_WARM_INDEX_SETTING.getKey()));
         assertEquals(HOT_TO_WARM.toString(), settings.get(INDEX_TIERING_STATE.getKey()));
         assertEquals(TIERED_COMPOSITE_INDEX_TYPE, settings.get(INDEX_COMPOSITE_STORE_TYPE_SETTING.getKey()));
-    }
-
-    public void testGetIndexTierSettingsToRestoreAfterCancellation() {
-        Settings settings = service.getIndexTierSettingsToRestoreAfterCancellation();
-        assertEquals("false", settings.get(IS_WARM_INDEX_SETTING.getKey()));
-        assertEquals(TieringState.HOT.toString(), settings.get(INDEX_TIERING_STATE.getKey()));
-        assertEquals("default", settings.get(INDEX_COMPOSITE_STORE_TYPE_SETTING.getKey()));
+        // Warm-specific: prevent auto-expansion and disable refresh on sealed index
+        assertEquals("false", settings.get(org.opensearch.cluster.metadata.AutoExpandReplicas.SETTING.getKey()));
+        assertEquals("-1", settings.get(IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey()));
     }
 
     public void testGetTieringStartTimeKey() {
@@ -133,5 +141,63 @@ public class HotToWarmTieringServiceTests extends OpenSearchTestCase {
         when(node.isWarmNode()).thenReturn(true);
 
         assertTrue(service.isShardInTargetTier(shard, clusterState));
+    }
+
+    /**
+     * removeWriteBlock must remove INDEX_READ_ONLY_ALLOW_DELETE_BLOCK when the index
+     * tiering state is HOT (i.e. tier() has not yet run). This is the normal failure
+     * cleanup path called by TransportHotToWarmTierAction on pre-sync failure.
+     */
+    public void testRemoveWriteBlockRemovesBlockWhenIndexIsHot() throws Exception {
+        String indexName = "test-index";
+        IndexMetadata indexMetadata = IndexMetadata.builder(indexName)
+            .settings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(INDEX_TIERING_STATE.getKey(), HOT.toString())
+            )
+            .numberOfShards(1)
+            .numberOfReplicas(0)
+            .build();
+        ClusterState stateWithBlock = ClusterState.builder(new ClusterName("test"))
+            .metadata(Metadata.builder().put(indexMetadata, true))
+            .blocks(ClusterBlocks.builder().addIndexBlock(indexName, IndexMetadata.INDEX_READ_ONLY_ALLOW_DELETE_BLOCK).build())
+            .build();
+
+        ArgumentCaptor<ClusterStateUpdateTask> taskCaptor = ArgumentCaptor.forClass(ClusterStateUpdateTask.class);
+        service.removeWriteBlock(indexName);
+        verify(clusterService).submitStateUpdateTask(any(), taskCaptor.capture());
+
+        ClusterState result = taskCaptor.getValue().execute(stateWithBlock);
+        assertFalse(result.blocks().hasIndexBlock(indexName, IndexMetadata.INDEX_READ_ONLY_ALLOW_DELETE_BLOCK));
+    }
+
+    /**
+     * removeWriteBlock must NOT remove the block if the index has already advanced to
+     * HOT_TO_WARM (i.e. tier() already ran). This prevents a stale cleanup task from
+     * interfering with an in-progress migration.
+     */
+    public void testRemoveWriteBlockDoesNotRemoveBlockWhenMigrationStarted() throws Exception {
+        String indexName = "test-index";
+        IndexMetadata indexMetadata = IndexMetadata.builder(indexName)
+            .settings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(INDEX_TIERING_STATE.getKey(), HOT_TO_WARM.toString())
+            )
+            .numberOfShards(1)
+            .numberOfReplicas(0)
+            .build();
+        ClusterState stateWithBlock = ClusterState.builder(new ClusterName("test"))
+            .metadata(Metadata.builder().put(indexMetadata, true))
+            .blocks(ClusterBlocks.builder().addIndexBlock(indexName, IndexMetadata.INDEX_READ_ONLY_ALLOW_DELETE_BLOCK).build())
+            .build();
+
+        ArgumentCaptor<ClusterStateUpdateTask> taskCaptor = ArgumentCaptor.forClass(ClusterStateUpdateTask.class);
+        service.removeWriteBlock(indexName);
+        verify(clusterService).submitStateUpdateTask(any(), taskCaptor.capture());
+
+        ClusterState result = taskCaptor.getValue().execute(stateWithBlock);
+        assertTrue(result.blocks().hasIndexBlock(indexName, IndexMetadata.INDEX_READ_ONLY_ALLOW_DELETE_BLOCK));
     }
 }
