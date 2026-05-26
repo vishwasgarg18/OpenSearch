@@ -192,6 +192,11 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
             // Below check ensures that if there is commit, then that gets picked up by both 1st and 2nd shouldSync call.
             || isRefreshAfterCommitSafe()
             || isRemoteSegmentStoreInSync() == false;
+        // This condition will be true when shard is undergoing a hot to warm migration.
+        if (indexShard.isSegmentsUploadToRemoteBlocked()) {
+            logger.info("skipping segments upload to remote during hot to warm index migration");
+            return false;
+        }
         if (shouldSync || skipPrimaryTermCheck) {
             return shouldSync;
         }
@@ -618,6 +623,11 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
      * @return true iff the shard is a started with primary mode true or it is local or snapshot recovery.
      */
     private boolean isReadyForUpload() {
+        // Block uploads after pre-tiering sync to prevent post-sync merges from
+        // uploading segments the warm node won't use.
+        if (indexShard.isSegmentsUploadToRemoteBlocked()) {
+            return false;
+        }
         boolean isReady = indexShard.isStartedPrimary() || isLocalOrSnapshotRecoveryOrSeeding();
 
         if (isReady == false) {

@@ -645,9 +645,21 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
                      * If this shard copy is tracked then we got here here via a rolling upgrade from an older version that doesn't
                      * create peer recovery retention leases for every shard copy.
                      */
-                    assert (checkpoints.get(shardRouting.allocationId().getId()).tracked
-                        && checkpoints.get(shardRouting.allocationId().getId()).replicated == false)
-                        || checkpoints.get(shardRouting.allocationId().getId()).tracked == false
+                    final CheckpointState cps = checkpoints.get(shardRouting.allocationId().getId());
+                    logger.debug(
+                        "renewPeerRecoveryRetentionLeases: no lease for [{}], tracked={}, replicated={}, "
+                            + "hasAllPeerRecoveryRetentionLeases={}, isRemoteStoreEnabled={}, isWarmIndex={}, "
+                            + "isPluggableDataFormatEnabled={}",
+                        shardRouting,
+                        cps.tracked,
+                        cps.replicated,
+                        hasAllPeerRecoveryRetentionLeases,
+                        indexSettings.isRemoteStoreEnabled(),
+                        indexSettings.isWarmIndex(),
+                        indexSettings.isPluggableDataFormatEnabled()
+                    );
+                    assert (cps.tracked && cps.replicated == false)
+                        || cps.tracked == false
                         || hasAllPeerRecoveryRetentionLeases == false;
                     return false;
                 }
@@ -688,16 +700,16 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
     }
 
     /**
-    * The state of the lucene checkpoint
-    *
-    * @opensearch.api
-    */
+     * The state of the lucene checkpoint
+     *
+     * @opensearch.api
+     */
     @PublicApi(since = "1.0.0")
     public static class CheckpointState implements Writeable {
 
         /**
-        * the last local checkpoint information that we have for this shard. All operations up to this point are properly fsynced to disk.
-        */
+         * the last local checkpoint information that we have for this shard. All operations up to this point are properly fsynced to disk.
+         */
         long localCheckpoint;
 
         /**
@@ -909,7 +921,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
         // when in primary mode, the current allocation ID is the allocation ID of the primary or the relocation allocation ID
         assert !primaryMode
             || (routingTable.primaryShard().allocationId().getId().equals(shardAllocationId)
-                || routingTable.primaryShard().allocationId().getRelocationId().equals(shardAllocationId));
+            || routingTable.primaryShard().allocationId().getRelocationId().equals(shardAllocationId));
 
         // during relocation handoff there are no entries blocking global checkpoint advancement
         assert !handoffInProgress || pendingInSync.isEmpty() : "entries blocking global checkpoint advancement during relocation handoff: "
@@ -921,21 +933,21 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
         // the computed global checkpoint is always up-to-date
         assert !primaryMode || globalCheckpoint == computeGlobalCheckpoint(pendingInSync, checkpoints.values(), globalCheckpoint)
             : "global checkpoint is not up-to-date, expected: "
-                + computeGlobalCheckpoint(pendingInSync, checkpoints.values(), globalCheckpoint)
-                + " but was: "
-                + globalCheckpoint;
+            + computeGlobalCheckpoint(pendingInSync, checkpoints.values(), globalCheckpoint)
+            + " but was: "
+            + globalCheckpoint;
 
         // when in primary mode, the global checkpoint is at most the minimum local checkpoint on all in-sync shard copies
         assert !primaryMode || globalCheckpoint <= inSyncCheckpointStates(checkpoints, CheckpointState::getLocalCheckpoint, LongStream::min)
             : "global checkpoint ["
-                + globalCheckpoint
-                + "] "
-                + "for primary mode allocation ID ["
-                + shardAllocationId
-                + "] "
-                + "more than in-sync local checkpoints ["
-                + checkpoints
-                + "]";
+            + globalCheckpoint
+            + "] "
+            + "for primary mode allocation ID ["
+            + shardAllocationId
+            + "] "
+            + "more than in-sync local checkpoints ["
+            + checkpoints
+            + "]";
 
         // we have a routing table iff we have a replication group
         assert (routingTable == null) == (replicationGroup == null) : "routing table is "
@@ -1112,10 +1124,10 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
             newVersion = replicationGroup.getVersion() + 1;
         }
         assert newVersion == 0 || indexSettings.isRemoteTranslogStoreEnabled()
-        // Handle migration cases. Ignore assertion if any of the shard copies in the replication group is assigned to a remote node
+            // Handle migration cases. Ignore assertion if any of the shard copies in the replication group is assigned to a remote node
             || replicationGroup.getReplicationTargets()
-                .stream()
-                .anyMatch(shardRouting -> isShardOnRemoteEnabledNode.apply(shardRouting.currentNodeId()))
+            .stream()
+            .anyMatch(shardRouting -> isShardOnRemoteEnabledNode.apply(shardRouting.currentNodeId()))
             || checkpoints.entrySet().stream().filter(e -> e.getValue().tracked).allMatch(e -> e.getValue().replicated)
             : "In absence of remote translog store, all tracked shards must have replication mode as LOGICAL_REPLICATION";
 
@@ -1278,7 +1290,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
                     && shouldSkipReplicationTimer(allocationId) == false
                     && latestReplicationCheckpoint.isAheadOf(cps.visibleReplicationCheckpoint)
                     && (indexSettings.isSegRepLocalEnabled() == true
-                        || isShardOnRemoteEnabledNode.apply(routingTable.getByAllocationId(allocationId).currentNodeId()))) {
+                    || isShardOnRemoteEnabledNode.apply(routingTable.getByAllocationId(allocationId).currentNodeId()))) {
                     cps.checkpointTimers.computeIfAbsent(latestReplicationCheckpoint, ignored -> new SegmentReplicationLagTimer());
                     logger.trace(
                         () -> new ParameterizedMessage(
@@ -1347,9 +1359,9 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
                         - Index is assigned to remote node (Primary has been seeded) but the corresponding replication group entry has not yet moved to remote
                         */
                         && (indexSettings.isRemoteStoreEnabled()
-                            || indexSettings.isSegRepLocalEnabled()
-                            || (indexSettings.isAssignedOnRemoteNode()
-                                && isShardOnRemoteEnabledNode.apply(routingTable.getByAllocationId(entry.getKey()).currentNodeId())))
+                        || indexSettings.isSegRepLocalEnabled()
+                        || (indexSettings.isAssignedOnRemoteNode()
+                        && isShardOnRemoteEnabledNode.apply(routingTable.getByAllocationId(entry.getKey()).currentNodeId())))
                 )
                 .map(entry -> buildShardStats(entry.getKey(), entry.getValue()))
                 .collect(Collectors.toUnmodifiableSet());
@@ -1384,10 +1396,10 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
         assert checkpoints.get(shardAllocationId) != null
             && checkpoints.get(shardAllocationId).inSync
             && checkpoints.get(shardAllocationId).localCheckpoint == SequenceNumbers.UNASSIGNED_SEQ_NO : "expected "
-                + shardAllocationId
-                + " to have initialized entry in "
-                + checkpoints
-                + " when activating primary";
+            + shardAllocationId
+            + " to have initialized entry in "
+            + checkpoints
+            + " when activating primary";
         assert localCheckpoint >= SequenceNumbers.NO_OPS_PERFORMED;
         primaryMode = true;
         updateLocalCheckpoint(shardAllocationId, checkpoints.get(shardAllocationId), localCheckpoint);
@@ -1435,15 +1447,15 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
             }
         } else if (hasAllPeerRecoveryRetentionLeases == false
             && routingTable.assignedShards()
-                .stream()
-                .allMatch(
-                    shardRouting -> retentionLeases.contains(getPeerRecoveryRetentionLeaseId(shardRouting))
-                        || checkpoints.get(shardRouting.allocationId().getId()).tracked == false
-                )) {
-                    // Although this index is old enough not to have all the expected peer recovery retention leases, in fact it does, so we
-                    // don't need to do any more work.
-                    hasAllPeerRecoveryRetentionLeases = true;
-                }
+            .stream()
+            .allMatch(
+                shardRouting -> retentionLeases.contains(getPeerRecoveryRetentionLeaseId(shardRouting))
+                    || checkpoints.get(shardRouting.allocationId().getId()).tracked == false
+            )) {
+            // Although this index is old enough not to have all the expected peer recovery retention leases, in fact it does, so we
+            // don't need to do any more work.
+            hasAllPeerRecoveryRetentionLeases = true;
+        }
     }
 
     /**
@@ -1463,9 +1475,9 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
             assert !primaryMode
                 || inSyncAllocationIds.stream().allMatch(inSyncId -> checkpoints.containsKey(inSyncId) && checkpoints.get(inSyncId).inSync)
                 : "update from cluster-manager in primary mode contains in-sync ids "
-                    + inSyncAllocationIds
-                    + " that have no matching entries in "
-                    + checkpoints;
+                + inSyncAllocationIds
+                + " that have no matching entries in "
+                + checkpoints;
             // remove entries which don't exist on cluster-manager
             Set<String> initializingAllocationIds = routingTable.getAllInitializingShards()
                 .stream()
@@ -1566,7 +1578,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
     private boolean assignedToRemoteStoreNode(IndexShardRoutingTable routingTable, String allocationId) {
         return indexSettings().isRemoteStoreEnabled()
             || (routingTable.getByAllocationId(allocationId) != null
-                && isShardOnRemoteEnabledNode.apply(routingTable.getByAllocationId(allocationId).currentNodeId()));
+            && isShardOnRemoteEnabledNode.apply(routingTable.getByAllocationId(allocationId).currentNodeId()));
     }
 
     /**
@@ -1858,6 +1870,16 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
         assert invariant();
     }
 
+    /**
+     * Resets hasAllPeerRecoveryRetentionLeases to false. Called when a DFA read-only engine is created
+     * (warm primary) to prevent assertion failures in renewPeerRecoveryRetentionLeases() during the
+     * window between primary activation and async lease creation via ensurePeerRecoveryRetentionLeasesExist().
+     * The flag will be set back to true when[[[###REDACTED_AWS_SECRET_KEY_REDACTED###]]]) completes.
+     */
+    public synchronized void resetHasAllPeerRecoveryRetentionLeases() {
+        hasAllPeerRecoveryRetentionLeases = false;
+    }
+
     private synchronized void setCreatedMissingRetentionLeases() {
         createdMissingRetentionLeases = true;
         assert invariant();
@@ -1879,8 +1901,8 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
         // No-Op if retention leases for the tracked shard copy already exists
         boolean createMissingRetentionLeasesDuringMigration = indexSettings.isAssignedOnRemoteNode()
             && replicationGroup.getReplicationTargets()
-                .stream()
-                .anyMatch(shardRouting -> isShardOnRemoteEnabledNode.apply(shardRouting.currentNodeId()) == false);
+            .stream()
+            .anyMatch(shardRouting -> isShardOnRemoteEnabledNode.apply(shardRouting.currentNodeId()) == false);
         if (hasAllPeerRecoveryRetentionLeases == false || createMissingRetentionLeasesDuringMigration) {
             final List<ShardRouting> shardRoutings = routingTable.assignedShards();
             final GroupedActionListener<ReplicationResponse> groupedActionListener = new GroupedActionListener<>(ActionListener.wrap(vs -> {

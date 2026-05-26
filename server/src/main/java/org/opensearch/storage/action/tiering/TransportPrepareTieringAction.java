@@ -158,10 +158,14 @@ public class TransportPrepareTieringAction extends TransportBroadcastByNodeActio
     /**
      * Waits until all local segments are uploaded to remote store.
      * Blocks until remote store is fully in sync with local state.
+     * After sync completes, blocks further segment uploads to prevent post-sync
+     * merges from uploading segments the warm node won't use.
      */
     private void waitForRemoteSync(IndexShard indexShard, ShardRouting shardRouting) throws IOException {
         logger.trace("Waiting for remote store sync on shard [{}]", shardRouting.shardId());
         indexShard.waitForRemoteStoreSync();
+        indexShard.blockSegmentsUploadToRemote();
+        logger.trace("Blocked segment uploads to remote store on shard [{}]", shardRouting.shardId());
     }
 
     /**
