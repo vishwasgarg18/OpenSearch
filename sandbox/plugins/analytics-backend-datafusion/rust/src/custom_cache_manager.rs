@@ -739,10 +739,10 @@ mod store_aware_warm_tests {
         assert_eq!(metadata_cache.len(), 1);
     }
 
-    // store_ptr > 0 (warm): when a statistics cache is configured, it is also warmed by pulling the
-    // footer through the boxed object store (not just the metadata cache).
+    // store_ptr > 0 (warm): when both caches are configured, add_files warms the metadata cache
+    // and the statistics cache, pulling each from the footer through the boxed object store.
     #[test]
-    fn warm_store_ptr_also_warms_statistics_cache() {
+    fn warm_store_ptr_warms_metadata_and_statistics_caches() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("seg_0.parquet");
         write_parquet(&file_path);
