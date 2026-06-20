@@ -421,10 +421,10 @@ impl CustomCacheManager {
         }
     }
 
-    /// Compute and put statistics into cache. Reads the parquet footer through the resolved object
-    /// store — warm shard (store_ptr > 0): the per-shard remote store; hot (store_ptr == 0): local
-    /// std::fs — and derives statistics from it. The ObjectMeta comes from the same store so the
-    /// cached entry matches what the query path computes.
+    /// Compute and put statistics into cache. Warm shard (store_ptr > 0): read the footer through
+    /// the per-shard remote store (async). Hot (store_ptr == 0): read the local file synchronously
+    /// via compute_parquet_statistics (unchanged original path). The two derivations are kept
+    /// separate on purpose; only the warm branch needs the object store.
     pub fn statistics_cache_compute_and_put(
         &self,
         file_path: &str,
@@ -445,15 +445,48 @@ impl CustomCacheManager {
             return Ok(true);
         }
 
-        // Same logic for hot and warm — only the object store differs.
-        let (store, object_meta) = resolve_store_and_meta(file_path, rt_handle, store_ptr)?;
+        if store_ptr > 0 {
+            // Warm: the file lives on the per-shard remote store, so read its footer through that
+            // store (async) and derive statistics from it.
+            use datafusion::parquet::arrow::parquet_to_arrow_schema;
 
-        match compute_parquet_statistics(&store, &object_meta, rt_handle) {
-            Ok(stats) => {
-                cache.put_statistics(&path, Arc::new(stats), &object_meta);
-                Ok(true)
+            let (store, object_meta) = resolve_store_and_meta(file_path, rt_handle, store_ptr)?;
+            let stats = rt_handle.block_on(async {
+                let parquet_metadata = DFParquetMetadata::new(store.as_ref(), &object_meta)
+                    .fetch_metadata()
+                    .await
+                    .map_err(|e| format!("failed to fetch parquet metadata: {}", e))?;
+                let file_metadata = parquet_metadata.file_metadata();
+                let schema = Arc::new(
+                    parquet_to_arrow_schema(file_metadata.schema_descr(), file_metadata.key_value_metadata())
+                        .map_err(|e| format!("failed to derive arrow schema: {}", e))?,
+                );
+                DFParquetMetadata::statistics_from_parquet_metadata(&parquet_metadata, &schema)
+                    .map_err(|e| format!("failed to compute statistics: {}", e))
+            });
+            match stats {
+                Ok(stats) => {
+                    cache.put_statistics(&path, Arc::new(stats), &object_meta);
+                    Ok(true)
+                }
+                Err(e) => Err(format!("Failed to compute statistics for {}: {}", file_path, e)),
             }
-            Err(e) => Err(format!("Failed to compute statistics for {}: {}", file_path, e)),
+        } else {
+            // Hot: read the local file synchronously (unchanged original logic).
+            match compute_parquet_statistics(file_path) {
+                Ok(stats) => {
+                    let meta = ObjectMeta {
+                        location: path.clone(),
+                        last_modified: chrono::Utc::now(),
+                        size: std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0),
+                        e_tag: None,
+                        version: None,
+                    };
+                    cache.put_statistics(&path, Arc::new(stats), &meta);
+                    Ok(true)
+                }
+                Err(e) => Err(format!("Failed to compute statistics for {}: {}", file_path, e)),
+            }
         }
     }
 

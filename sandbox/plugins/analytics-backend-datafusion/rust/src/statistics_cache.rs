@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use std::fs::File;
+
 /// Trait to calculate heap memory size for statistics objects
 trait HeapSize {
     fn heap_size(&self) -> usize;
@@ -503,30 +505,34 @@ impl Default for CustomStatisticsCache {
     }
 }
 
-/// Compute statistics from a parquet file by reading its footer through the given object store.
-/// The logic is identical for hot and warm shards — only the object store differs (LocalFileSystem
-/// for hot, the per-shard remote store for warm).
-pub fn compute_parquet_statistics(
-    store: &Arc<dyn object_store::ObjectStore>,
-    object_meta: &ObjectMeta,
-    rt_handle: &tokio::runtime::Handle,
-) -> Result<Statistics, String> {
+/// Compute statistics from a parquet file using DataFusion's built-in functionality
+pub fn compute_parquet_statistics(file_path: &str) -> Result<Statistics, Box<dyn std::error::Error>> {
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
-    use datafusion::parquet::arrow::parquet_to_arrow_schema;
+    use object_store::local::LocalFileSystem;
+    use object_store::path::Path;
 
-    rt_handle.block_on(async {
-        let parquet_metadata = DFParquetMetadata::new(store.as_ref(), object_meta)
-            .fetch_metadata()
-            .await
-            .map_err(|e| format!("failed to fetch parquet metadata: {}", e))?;
-        let file_metadata = parquet_metadata.file_metadata();
-        let schema = Arc::new(
-            parquet_to_arrow_schema(file_metadata.schema_descr(), file_metadata.key_value_metadata())
-                .map_err(|e| format!("failed to derive arrow schema: {}", e))?,
-        );
-        DFParquetMetadata::statistics_from_parquet_metadata(&parquet_metadata, &schema)
-            .map_err(|e| format!("failed to compute statistics: {}", e))
-    })
+    let file = File::open(file_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let metadata = builder.metadata();
+    let schema = builder.schema().clone();
+
+    // Create ObjectStore and ObjectMeta for the file
+    let _store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let path = Path::from(file_path);
+    let file_metadata = std::fs::metadata(file_path)?;
+    let _object_meta = ObjectMeta {
+        location: path,
+        last_modified: chrono::DateTime::from(file_metadata.modified()?),
+        size: file_metadata.len(),
+        e_tag: None,
+        version: None,
+    };
+
+    // Use DataFusion's method to extract statistics from parquet metadata
+    // statistics_from_parquet_metadata is an associated function that takes metadata and schema
+    let statistics = DFParquetMetadata::statistics_from_parquet_metadata(metadata, &schema)?;
+    Ok(statistics)
 }
 
 #[cfg(test)]
