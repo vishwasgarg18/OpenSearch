@@ -77,32 +77,6 @@ fn resolve_store_and_meta(
     }
 }
 
-/// Derive parquet statistics by reading the file's footer through the given object store. The
-/// logic is identical for hot and warm shards — the only difference is the object store passed in
-/// (LocalFileSystem for hot, the per-shard remote store for warm), resolved by
-/// resolve_store_and_meta.
-fn compute_statistics_via_store(
-    store: &Arc<dyn ObjectStore>,
-    object_meta: &ObjectMeta,
-    rt_handle: &tokio::runtime::Handle,
-) -> Result<datafusion::common::Statistics, String> {
-    use datafusion::parquet::arrow::parquet_to_arrow_schema;
-
-    rt_handle.block_on(async {
-        let parquet_metadata = DFParquetMetadata::new(store.as_ref(), object_meta)
-            .fetch_metadata()
-            .await
-            .map_err(|e| format!("Failed to fetch parquet metadata: {}", e))?;
-        let file_metadata = parquet_metadata.file_metadata();
-        let schema = Arc::new(
-            parquet_to_arrow_schema(file_metadata.schema_descr(), file_metadata.key_value_metadata())
-                .map_err(|e| format!("Failed to derive arrow schema: {}", e))?,
-        );
-        DFParquetMetadata::statistics_from_parquet_metadata(&parquet_metadata, &schema)
-            .map_err(|e| format!("Failed to compute statistics: {}", e))
-    })
-}
-
 /// Custom CacheManager that holds cache references directly
 pub struct CustomCacheManager {
     /// Direct reference to the file metadata cache
@@ -473,45 +447,32 @@ impl CustomCacheManager {
 
         // Same logic for hot and warm — only the object store differs.
         let (store, object_meta) = resolve_store_and_meta(file_path, rt_handle, store_ptr)?;
-        let stats = compute_statistics_via_store(&store, &object_meta, rt_handle)?;
 
-        cache.put_statistics(&path, Arc::new(stats), &object_meta);
-        Ok(true)
+        match compute_parquet_statistics(&store, &object_meta, rt_handle) {
+            Ok(stats) => {
+                cache.put_statistics(&path, Arc::new(stats), &object_meta);
+                Ok(true)
+            }
+            Err(e) => Err(format!("Failed to compute statistics for {}: {}", file_path, e)),
+        }
     }
 
-    /// Batch compute and cache statistics for multiple files
-    pub fn statistics_cache_batch_compute_and_put(&self, file_paths: &[String]) -> Result<usize, String> {
-        let cache = self.statistics_cache.as_ref()
-            .ok_or_else(|| "No statistics cache configured".to_string())?;
-
+    /// Batch compute and cache statistics for multiple local files (hot path).
+    pub fn statistics_cache_batch_compute_and_put(
+        &self,
+        file_paths: &[String],
+        rt_handle: &tokio::runtime::Handle,
+    ) -> Result<usize, String> {
         let mut success_count = 0;
         let mut failed_files = Vec::new();
 
         for file_path in file_paths {
-            let path = Path::from(file_path.clone());
-
-            if cache.contains_key(&path) {
-                success_count += 1;
-                continue;
-            }
-
-            match compute_parquet_statistics(file_path) {
-                Ok(stats) => {
-                    let meta = ObjectMeta {
-                        location: path.clone(),
-                        last_modified: chrono::Utc::now(),
-                        size: std::fs::metadata(file_path)
-                            .map(|m| m.len())
-                            .unwrap_or(0),
-                        e_tag: None,
-                        version: None,
-                    };
-
-                    cache.put_statistics(&path, Arc::new(stats), &meta);
+            match self.statistics_cache_compute_and_put(file_path, rt_handle, 0) {
+                Ok(_) => {
                     success_count += 1;
                 }
                 Err(e) => {
-                    debug!("[STATS CACHE ERROR] Failed to compute statistics for {}: {}", file_path, e);
+                    debug!("[STATS CACHE ERROR] {}", e);
                     failed_files.push(file_path.clone());
                 }
             }
