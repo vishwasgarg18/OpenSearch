@@ -496,7 +496,7 @@ impl CustomCacheManager {
         store: Arc<dyn MetadataCachingStore>,
         rt_handle: &tokio::runtime::Handle,
     ) -> Result<Vec<(String, bool)>, String> {
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[init::warmup] add_files_with_store ENTRY n_files={}",
             file_paths.len()
         );
@@ -514,7 +514,7 @@ impl CustomCacheManager {
                 }
             }
         }
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[init::warmup] add_files_with_store DONE successes={}/{}",
             succ, file_paths.len()
         );
@@ -535,12 +535,12 @@ impl CustomCacheManager {
         rt_handle: &tokio::runtime::Handle,
     ) -> Result<bool, String> {
         if !file_path.to_lowercase().ends_with(".parquet") {
-            native_bridge_common::log_info!(
+            native_bridge_common::log_debug!(
                 "[init::warmup] file='{}' SKIPPED (non-parquet)", file_path
             );
             return Ok(false);
         }
-        native_bridge_common::log_info!("[init::warmup] file='{}' ENTRY", file_path);
+        native_bridge_common::log_debug!("[init::warmup] file='{}' ENTRY", file_path);
 
         // Step 1: Fetch footer only → heap cache (parsed ParquetMetaData)
         let (parquet_metadata, object_meta) = self.fetch_footer_to_heap(file_path, store, rt_handle)?;
@@ -583,14 +583,14 @@ impl CustomCacheManager {
             aligned_start..aligned_end
         }).collect();
         let total_pre_fetch_bytes: u64 = aligned_ranges.iter().map(|r| r.end - r.start).sum();
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[init::warmup] file='{}' index_ranges: page_index={} +1 footer (last 64KB) → {} chunk-aligned ranges total_bytes={}",
             file_path, pi_count, aligned_ranges.len(), total_pre_fetch_bytes
         );
 
         // Step 4: Fetch the ranges through the store (populates data Foyer on the way).
         let fetched_bytes = Self::fetch_ranges_via_store(store, file_path, &aligned_ranges, rt_handle)?;
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[init::warmup] file='{}' fetched n_ranges={} fetched_bytes={}",
             file_path, fetched_bytes.len(),
             fetched_bytes.iter().map(|b| b.len() as u64).sum::<u64>()
@@ -600,7 +600,7 @@ impl CustomCacheManager {
         // No-op when `store` is not a TieredObjectStore (default trait impl is no-op).
         // Inputs are chunk-aligned so every chunk in every range is fully covered.
         store.put_metadata(file_path, &aligned_ranges, &fetched_bytes);
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[init::warmup] file='{}' DONE (footer + page-index promoted to metadata Foyer)",
             file_path
         );
@@ -630,7 +630,7 @@ impl CustomCacheManager {
             store.head(&path).await
                 .map_err(|e| format!("Failed to head {}: {}", file_path, e))
         })?;
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[init::warmup] file='{}' head: size={} last_modified={}",
             file_path, object_meta.size, object_meta.last_modified
         );
@@ -647,7 +647,7 @@ impl CustomCacheManager {
             df_metadata.fetch_metadata().await
                 .map_err(|e| format!("Failed to fetch footer: {}", e))
         })?;
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[init::warmup] file='{}' footer parsed: rg_count={} col_count={}",
             file_path,
             parquet_metadata.num_row_groups(),
@@ -663,7 +663,7 @@ impl CustomCacheManager {
             Arc::new(CachedParquetMetaData::new(Arc::clone(&parquet_metadata))),
         );
         metadata_cache.put(&path, cached_entry);
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[init::warmup] file='{}' heap metadata_cache.put DONE (footer only)",
             file_path
         );
@@ -765,7 +765,7 @@ impl CustomCacheManager {
             .map_err(|e| format!("failed to compute statistics for {}: {}", file_path, e))?;
 
         cache.put_statistics(&path, Arc::new(stats), object_meta);
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[init::warmup] file='{}' statistics_cache.put DONE rg_count={}",
             file_path, parquet_metadata.num_row_groups()
         );

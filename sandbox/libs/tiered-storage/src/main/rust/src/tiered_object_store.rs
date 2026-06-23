@@ -167,7 +167,7 @@ impl TieredObjectStore {
         // reads probe under "Volumes/..." — silent cache miss on every read.
         let path_str = path.strip_prefix('/').unwrap_or(path);
         let total_bytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[init::tier-store] put_metadata path='{}' n_ranges={} total_bytes={} has_cache={}",
             path_str, ranges.len(), total_bytes, self.cache.is_some()
         );
@@ -592,13 +592,13 @@ impl TieredObjectStore {
     ) -> OsResult<Vec<Bytes>> {
         let n = miss_ranges.len();
         if let Some((rp, store)) = self.resolve_remote(path_str) {
-            native_bridge_common::log_info!(
+            native_bridge_common::log_debug!(
                 "[query::tier-store] →REMOTE path='{}' n={} (file is REMOTE in registry)",
                 path_str, n
             );
             return store.get_ranges(&rp, miss_ranges).await;
         }
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[query::tier-store] →LOCAL path='{}' n={} (trying local first)",
             path_str, n
         );
@@ -607,7 +607,7 @@ impl TieredObjectStore {
             Ok(bytes) => Ok(bytes),
             Err(ref e) => {
                 if let Some((rp, store)) = self.should_retry_remote(path_str, e) {
-                    native_bridge_common::log_info!(
+                    native_bridge_common::log_debug!(
                         "[query::tier-store] →LOCAL_THEN_REMOTE path='{}' n={} (local NotFound, retrying remote)",
                         path_str, n
                     );
@@ -841,7 +841,7 @@ impl ObjectStore for TieredObjectStore {
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OsResult<Vec<Bytes>> {
         let path_str = location.as_ref();
         let total_bytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[query::tier-store] get_ranges path='{}' n={} total_bytes={}",
             path_str, ranges.len(), total_bytes
         );
@@ -850,7 +850,7 @@ impl ObjectStore for TieredObjectStore {
 
         if miss_ranges.is_empty() {
             // Full cache hit — all ranges served from SSD.
-            native_bridge_common::log_info!(
+            native_bridge_common::log_debug!(
                 "[query::tier-store] FULL_FOYER_HIT path='{}' n={} total_bytes={}",
                 path_str, ranges.len(), total_bytes
             );
@@ -858,12 +858,12 @@ impl ObjectStore for TieredObjectStore {
         }
 
         if self.cache.is_some() {
-            native_bridge_common::log_info!(
+            native_bridge_common::log_debug!(
                 "[query::tier-store] FOYER_MISS path='{}' misses={}/{} (will fetch)",
                 path_str, miss_ranges.len(), ranges.len()
             );
         } else {
-            native_bridge_common::log_info!(
+            native_bridge_common::log_debug!(
                 "[query::tier-store] NO_CACHE path='{}' fetching={}/{}",
                 path_str, miss_ranges.len(), ranges.len()
             );

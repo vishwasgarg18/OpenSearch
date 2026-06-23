@@ -121,12 +121,12 @@ impl CacheAccessor<Path, CachedFileMetadataEntry> for MutexFileMetadataCache {
                 let result = cache.get(k);
                 if result.is_some() {
                     self.hit_count.fetch_add(1, Ordering::Relaxed);
-                    native_bridge_common::log_info!(
+                    native_bridge_common::log_debug!(
                         "[query::heap-cache] HIT path='{}'", k.as_ref()
                     );
                 } else {
                     self.miss_count.fetch_add(1, Ordering::Relaxed);
-                    native_bridge_common::log_info!(
+                    native_bridge_common::log_debug!(
                         "[query::heap-cache] MISS path='{}'", k.as_ref()
                     );
                 }
@@ -163,7 +163,7 @@ impl CacheAccessor<Path, CachedFileMetadataEntry> for MutexFileMetadataCache {
         } else {
             v
         };
-        native_bridge_common::log_info!(
+        native_bridge_common::log_debug!(
             "[query::heap-cache] PUT path='{}' size={} scoped_enabled={} stripped_page_index={}",
             k.as_ref(), v.meta.size, scoped, scoped && had_ci_or_oi
         );
