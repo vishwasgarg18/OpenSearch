@@ -40,6 +40,21 @@ use crate::registry::TieredStorageRegistry;
 use crate::types::{FileLocation, TieredFileEntry};
 
 // ---------------------------------------------------------------------------
+// Public constants
+// ---------------------------------------------------------------------------
+
+/// Cache chunk size used for chunk-aligned probe/put.
+///
+/// All cache writes go under chunk-aligned keys
+/// (`path\x1F{chunk_start}-{chunk_end}`) where chunk boundaries are multiples of
+/// this value (clamped to `file_size` for the trailing partial chunk). Callers
+/// of [`TieredObjectStore::put_metadata`] should align their input ranges to
+/// this size so every chunk they touch is fully covered and lands in the
+/// metadata tier under the same key shape that [`TieredObjectStore::probe_cache`]
+/// will look up at query time.
+pub const CACHE_CHUNK_SIZE: u64 = 8 << 20; // 8 MiB
+
+// ---------------------------------------------------------------------------
 // MetadataCachingStore — extension trait
 // ---------------------------------------------------------------------------
 
@@ -134,7 +149,17 @@ impl TieredObjectStore {
     /// bytes are in the durable metadata_cache — surviving LRU eviction from
     /// data scan pressure and node restarts.
     ///
-    /// No-op if no cache is attached.
+    /// Each input range is split into chunk-aligned (8 MiB) pieces and only
+    /// the chunks **fully contained** inside the range are written. This
+    /// keeps the metadata-tier keys aligned with the chunk-aligned probes
+    /// performed by [`Self::probe_cache`] so warmup-promoted bytes can
+    /// actually serve future queries. Partial edge chunks (where the range
+    /// covers only part of a chunk) are skipped — those chunks are typically
+    /// already populated in the data tier as a side effect of the upstream
+    /// `get_ranges` call that produced `data`.
+    ///
+    /// No-op if no cache is attached. Falls back to exact-key writes when
+    /// `file_size` is unknown (registry has no size for this path).
     pub fn put_metadata(&self, path: &str, ranges: &[std::ops::Range<u64>], data: &[Bytes]) {
         // Normalize path by stripping leading '/' to match `object_store::Path` semantics
         // (read paths through ObjectStore::get_opts/get_ranges arrive with the leading '/'
@@ -146,11 +171,9 @@ impl TieredObjectStore {
             "[init::tier-store] put_metadata path='{}' n_ranges={} total_bytes={} has_cache={}",
             path_str, ranges.len(), total_bytes, self.cache.is_some()
         );
-        if let Some(ref cache) = self.cache {
-            for (r, bytes) in ranges.iter().zip(data.iter()) {
-                let key = range_cache_key(path_str, r.start, r.end);
-                cache.put_metadata(&key, bytes.clone());
-            }
+
+        for (r, bytes) in ranges.iter().zip(data.iter()) {
+            self.write_chunk_aligned(path_str, r, bytes, /* to_metadata_tier */ true);
         }
     }
 
@@ -336,6 +359,114 @@ impl TieredObjectStore {
         None
     }
 
+    /// Write bytes covering `range` into the block cache under chunk-aligned keys.
+    ///
+    /// For every chunk fully contained inside `range`, a slice of `bytes` is written
+    /// under that chunk's chunk-aligned key. Partial-edge chunks (where `range` does
+    /// not fully cover the chunk) are skipped — the caller must hold the full chunk's
+    /// bytes for any chunk to be written.
+    ///
+    /// When `to_metadata_tier` is true, writes go through `cache.put_metadata` (the
+    /// never-evict tier); otherwise through `cache.put` (the LRU data tier).
+    ///
+    /// File-size-unknown fallback: writes a single exact-key entry covering `range`
+    /// (preserves legacy behaviour).
+    fn write_chunk_aligned(
+        &self,
+        path_str: &str,
+        range: &Range<u64>,
+        bytes: &Bytes,
+        to_metadata_tier: bool,
+    ) {
+        let Some(cache) = self.cache.as_ref() else { return; };
+
+        let put = |key: &opensearch_block_cache::range_cache::CacheKey, b: Bytes| {
+            if to_metadata_tier {
+                cache.put_metadata(key, b);
+            } else {
+                cache.put(key, b);
+            }
+        };
+
+        let file_size = self.registry.get(path_str)
+            .map(|g| g.size())
+            .filter(|&s| s > 0)
+            .unwrap_or(0);
+
+        if file_size == 0 {
+            // Legacy: no chunk alignment, exact-key write.
+            let key = range_cache_key(path_str, range.start, range.end);
+            put(&key, bytes.clone());
+            return;
+        }
+
+        // Walk every chunk this range touches; write only fully-covered chunks.
+        let mut chunk_start = range.start / CACHE_CHUNK_SIZE * CACHE_CHUNK_SIZE;
+        while chunk_start < range.end {
+            let chunk_end = (chunk_start + CACHE_CHUNK_SIZE).min(file_size);
+            if chunk_end <= chunk_start {
+                // No progress possible — `range.end` extends past `file_size` and we've
+                // already walked past EOF. Defensive bail to avoid an infinite loop.
+                break;
+            }
+            if chunk_start >= range.start && chunk_end <= range.end {
+                let off = (chunk_start - range.start) as usize;
+                let len = (chunk_end - chunk_start) as usize;
+                let key = range_cache_key(path_str, chunk_start, chunk_end);
+                put(&key, bytes.slice(off..off + len));
+            }
+            chunk_start = chunk_end;
+        }
+    }
+
+    /// Probe the cache for a single byte range with chunk-aligned slicing.
+    ///
+    /// Returns `Some(bytes)` on cache hit (zero-copy slice from the cached chunk),
+    /// `None` on cache miss, cross-boundary range, or when no cache is attached.
+    ///
+    /// Used as the per-range building block for both [`Self::probe_cache`]
+    /// (multi-range get_ranges) and [`Self::try_serve_from_cache`] (single-range
+    /// get_opts) so both code paths use identical cache-key shape.
+    ///
+    /// File-size-unknown fallback: when the registry has no size for the path,
+    /// falls back to an exact-key lookup. This preserves legacy behaviour for
+    /// tests / paths where size isn't tracked.
+    async fn probe_single_range(
+        &self,
+        path_str: &str,
+        start: u64,
+        end: u64,
+    ) -> Option<Bytes> {
+        let cache = self.cache.as_ref()?;
+
+        let file_size = self.registry.get(path_str)
+            .map(|g| g.size())
+            .filter(|&s| s > 0)
+            .unwrap_or(0);
+
+        if file_size == 0 {
+            // No file size — fall back to exact-key lookup (legacy).
+            let key = range_cache_key(path_str, start, end);
+            return cache.get(&key).await;
+        }
+
+        let chunk_start = start / CACHE_CHUNK_SIZE * CACHE_CHUNK_SIZE;
+        let chunk_end = (chunk_start + CACHE_CHUNK_SIZE).min(file_size);
+
+        if end > chunk_end {
+            // Cross-boundary — caller decides how to handle (probe_cache emits a
+            // chunk-aligned span as the miss range; try_serve_from_cache returns
+            // None and lets the upstream fetch path run).
+            return None;
+        }
+
+        let key = range_cache_key(path_str, chunk_start, chunk_end);
+        let cached = cache.get(&key).await?;
+        let off = (start - chunk_start) as usize;
+        let len = (end - start) as usize;
+        Some(cached.slice(off..off + len))
+    }
+
     /// Try to serve a range read from the cache. Returns `Some(Ok(GetResult))` on hit,
     /// `None` on miss. Does NOT auto-populate the cache on miss.
     ///
@@ -347,10 +478,8 @@ impl TieredObjectStore {
         location: &Path,
         range: &GetRange,
     ) -> Option<OsResult<GetResult>> {
-        let cache = self.cache.as_ref()?;
         let (start, end) = self.resolve_range(path_str, range)?;
-        let key = range_cache_key(path_str, start, end);
-        let cached = cache.get(&key).await?;
+        let cached = self.probe_single_range(path_str, start, end).await?;
         let file_size = self.registry.get(path_str)
             .map(|g| g.size())
             .unwrap_or(end);
@@ -373,80 +502,77 @@ impl TieredObjectStore {
 
     /// Phase 1 — probe the block cache for each requested range.
     ///
+    /// Per-range cache lookup is delegated to [`Self::probe_single_range`] so the
+    /// chunk-aligned key shape is shared with [`Self::try_serve_from_cache`].
+    ///
     /// Returns:
     /// - `slots`: one entry per input range — `Some(bytes)` for hits, `None` for misses
     /// - `miss_indices`: original indices of the ranges that missed
-    /// - `miss_ranges`: the ranges that need to be fetched from the backing store
+    /// - `miss_ranges`: ranges to fetch from the backing store. For ranges that fit
+    ///   in a single chunk this is the chunk range; for cross-boundary ranges it is
+    ///   the chunk-aligned span. Phase 3 splits multi-chunk spans into per-chunk
+    ///   cache entries on populate.
     ///
-    /// When no cache is attached all ranges are unconditionally treated as misses.
+    /// When no cache is attached all ranges are unconditionally treated as misses
+    /// with their original (unaligned) bounds.
     async fn probe_cache(
         &self,
         path_str: &str,
         ranges: &[Range<u64>],
     ) -> (Vec<Option<Bytes>>, Vec<usize>, Vec<Range<u64>>) {
-        /// Cache chunk size: 8 MiB.
-        const CHUNK_SIZE: u64 = 8 << 20;
-
         let mut slots: Vec<Option<Bytes>> = Vec::with_capacity(ranges.len());
         let mut miss_indices: Vec<usize> = Vec::new();
         let mut miss_ranges: Vec<Range<u64>> = Vec::new();
 
-        if let Some(ref cache) = self.cache {
-            let file_size = self.registry.get(path_str)
-                .map(|g| g.size())
-                .filter(|&s| s > 0)
-                .unwrap_or(0);
-
-            for (i, r) in ranges.iter().enumerate() {
-                if file_size == 0 {
-                    // File size unknown — exact key, no alignment.
-                    let key = range_cache_key(path_str, r.start, r.end);
-                    if let Some(cached) = cache.get(&key).await {
-                        slots.push(Some(cached));
-                    } else {
-                        slots.push(None);
-                        miss_indices.push(i);
-                        miss_ranges.push(r.clone());
-                    }
-                } else {
-                    // Align to 8 MiB chunk boundary.
-                    let chunk_start = r.start / CHUNK_SIZE * CHUNK_SIZE;
-                    let chunk_end = (chunk_start + CHUNK_SIZE).min(file_size);
-
-                    // If the range spans beyond this chunk, use exact key (no alignment).
-                    if r.end > chunk_end {
-                        let key = range_cache_key(path_str, r.start, r.end);
-                        if let Some(cached) = cache.get(&key).await {
-                            slots.push(Some(cached));
-                        } else {
-                            slots.push(None);
-                            miss_indices.push(i);
-                            miss_ranges.push(r.clone());
-                        }
-                    } else {
-                        let key = range_cache_key(path_str, chunk_start, chunk_end);
-
-                        if let Some(cached) = cache.get(&key).await {
-                            let offset = (r.start - chunk_start) as usize;
-                            let len = (r.end - r.start) as usize;
-                            slots.push(Some(cached.slice(offset..offset + len)));
-                        } else {
-                            slots.push(None);
-                            miss_indices.push(i);
-                            let chunk_range = chunk_start..chunk_end;
-                            if !miss_ranges.contains(&chunk_range) {
-                                miss_ranges.push(chunk_range);
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // No cache — all ranges are misses.
+        if self.cache.is_none() {
+            // No cache — all ranges are misses with original (unaligned) bounds.
             for (i, r) in ranges.iter().enumerate() {
                 slots.push(None);
                 miss_indices.push(i);
                 miss_ranges.push(r.clone());
+            }
+            return (slots, miss_indices, miss_ranges);
+        }
+
+        let file_size = self.registry.get(path_str)
+            .map(|g| g.size())
+            .filter(|&s| s > 0)
+            .unwrap_or(0);
+
+        for (i, r) in ranges.iter().enumerate() {
+            if let Some(bytes) = self.probe_single_range(path_str, r.start, r.end).await {
+                slots.push(Some(bytes));
+                continue;
+            }
+
+            // Miss path: figure out what to fetch.
+            slots.push(None);
+            miss_indices.push(i);
+
+            if file_size == 0 {
+                // Legacy: no chunk alignment, push exact range.
+                miss_ranges.push(r.clone());
+                continue;
+            }
+
+            let chunk_start = r.start / CACHE_CHUNK_SIZE * CACHE_CHUNK_SIZE;
+            let chunk_end = (chunk_start + CACHE_CHUNK_SIZE).min(file_size);
+
+            let mr = if r.end > chunk_end {
+                // Cross-boundary: emit chunk-aligned span (chunk_floor .. chunk_ceil
+                // capped at file_size). Phase 3 will fetch this span as one upstream
+                // GET and split it into per-chunk cache entries.
+                let span_end = r.end.div_ceil(CACHE_CHUNK_SIZE)
+                    .saturating_mul(CACHE_CHUNK_SIZE)
+                    .min(file_size);
+                chunk_start..span_end
+            } else {
+                // Single-chunk: the chunk range.
+                chunk_start..chunk_end
+            };
+
+            if !miss_ranges.contains(&mr) {
+                miss_ranges.push(mr);
             }
         }
 
@@ -495,9 +621,13 @@ impl TieredObjectStore {
 
     /// Phase 3 — populate the block cache with fetched chunks and reassemble results.
     ///
-    /// When a cache is attached and file_size is known, fetched data corresponds to
-    /// aligned chunks. Each chunk is cached under its aligned key, and each original
-    /// range is sliced from the corresponding chunk.
+    /// Each fetched miss-range is written via [`Self::write_chunk_aligned`], so:
+    /// - Single-chunk miss-range: cached as one entry under its chunk key.
+    /// - Multi-chunk span: split into per-chunk slices, each cached under its
+    ///   chunk key. Future single-chunk reads of any of those chunks hit the cache.
+    ///
+    /// Slot reassembly uses containment (`mr.start <= r.start && r.end <= mr.end`)
+    /// so both single-chunk slots and cross-boundary span slots resolve uniformly.
     fn populate_cache_and_reassemble(
         &self,
         path_str: &str,
@@ -507,42 +637,23 @@ impl TieredObjectStore {
         miss_ranges: &[Range<u64>],
         slots: &mut Vec<Option<Bytes>>,
     ) {
-        const CHUNK_SIZE: u64 = 8 << 20;
-
-        if let Some(ref cache) = self.cache {
-            // Cache each fetched chunk/range.
+        if self.cache.is_some() {
+            // Cache each fetched miss-range under chunk-aligned keys (or exact key
+            // when file_size is unknown). Multi-chunk spans are split per chunk.
             for (data, mr) in fetched.iter().zip(miss_ranges.iter()) {
-                let key = range_cache_key(path_str, mr.start, mr.end);
-                cache.put(&key, data.clone());
+                self.write_chunk_aligned(path_str, mr, data, /* to_metadata_tier */ false);
             }
 
-            let file_size = self.registry.get(path_str)
-                .map(|g| g.size())
-                .filter(|&s| s > 0)
-                .unwrap_or(0);
-
-            // Reassemble each missed slot.
+            // Reassemble each missed slot via containment lookup.
             for &slot_i in miss_indices {
                 let r = &ranges[slot_i];
-                if file_size == 0 {
-                    // No alignment — miss_ranges matches original ranges.
-                    if let Some(pos) = miss_ranges.iter().position(|mr| mr == r) {
-                        slots[slot_i] = Some(fetched[pos].clone());
-                    }
-                } else {
-                    // Try exact range match first (cross-boundary fallback).
-                    if let Some(pos) = miss_ranges.iter().position(|mr| mr == r) {
-                        slots[slot_i] = Some(fetched[pos].clone());
-                    } else {
-                        // Try aligned chunk match and slice.
-                        let chunk_start = r.start / CHUNK_SIZE * CHUNK_SIZE;
-                        let chunk_end = (chunk_start + CHUNK_SIZE).min(file_size);
-                        if let Some(pos) = miss_ranges.iter().position(|mr| mr.start == chunk_start && mr.end == chunk_end) {
-                            let offset = (r.start - chunk_start) as usize;
-                            let len = (r.end - r.start) as usize;
-                            slots[slot_i] = Some(fetched[pos].slice(offset..offset + len));
-                        }
-                    }
+                if let Some(pos) = miss_ranges
+                    .iter()
+                    .position(|mr| mr.start <= r.start && r.end <= mr.end)
+                {
+                    let off = (r.start - miss_ranges[pos].start) as usize;
+                    let len = (r.end - r.start) as usize;
+                    slots[slot_i] = Some(fetched[pos].slice(off..off + len));
                 }
             }
         } else {
@@ -631,28 +742,77 @@ impl ObjectStore for TieredObjectStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
         let path_str = location.as_ref();
 
-        // Fast path for head: check registry/directory without I/O
+        // (1) Head fast path: answer from the registry/directory without I/O.
+        // On Some, return verbatim (including NotFound for directory paths).
+        // On None, fall through to the direct path with `options` unmodified.
         if options.head {
             if let Some(result) = self.try_head_from_registry(location, path_str) {
                 return result;
             }
         }
 
-        // Cache probe for range reads. Serves entries from metadata Foyer
-        // (put there by warmup) or data Foyer (populated on prior miss).
-        // On miss: fetches from S3/local, then populates data Foyer via put()
-        // so repeated reads hit cache.
+        // (2) Ranged read routing.
         if let Some(ref get_range) = options.range {
+            // (2a) Hot-hit fast path: single-chunk cache hit served directly,
+            // avoiding the get_ranges probe/logging machinery. Returns None for
+            // cross-boundary ranges and on any miss, in which case we proceed.
             if let Some(result) = self.try_serve_from_cache(path_str, location, get_range).await {
                 return result;
             }
+
+            // (2b) Resolvability: unresolvable Suffix/Offset (unknown file_size)
+            // falls through to the direct remote/local path with no cache write.
+            if let Some((start, end)) = self.resolve_range(path_str, get_range) {
+                // (2c) Streaming guard: oversized ranges stream via the direct
+                // path rather than buffering through get_ranges. TieredBlockCache
+                // reports the per-entry ceiling; fall back to 32 MiB otherwise.
+                let max_size = self
+                    .cache
+                    .as_ref()
+                    .and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<opensearch_block_cache::tiered_block_cache::TieredBlockCache>()
+                    })
+                    .map(|t| t.max_data_entry_size())
+                    .unwrap_or(32 * 1024 * 1024);
+
+                if end - start <= max_size {
+                    // (2d) Route through the shared chunk-aligned machinery so the
+                    // enclosing chunk(s) are fetched and cached symmetrically with
+                    // get_ranges. Exactly one range requested ⇒ one Bytes back.
+                    let mut parts = self.get_ranges(location, &[start..end]).await?;
+                    let bytes = parts.pop().unwrap_or_default();
+                    let file_size = self
+                        .registry
+                        .get(path_str)
+                        .map(|g| g.size())
+                        .filter(|&s| s > 0)
+                        .unwrap_or(end);
+                    let meta = ObjectMeta {
+                        location: location.clone(),
+                        last_modified: chrono::DateTime::<chrono::Utc>::default(),
+                        size: file_size,
+                        e_tag: None,
+                        version: None,
+                    };
+                    return Ok(GetResult {
+                        payload: object_store::GetResultPayload::Stream(
+                            futures::stream::once(async { Ok(bytes) }).boxed(),
+                        ),
+                        meta,
+                        range: start..end,
+                        attributes: Default::default(),
+                    });
+                }
+                // oversized → fall through to the streaming direct path.
+            }
+            // unresolvable → fall through to the streaming direct path.
         }
 
-        // Cache miss — fetch from remote/local then populate data Foyer.
-        // This ensures single-range reads (CachedMetadataReader::get_bytes for
-        // column chunks in the IndexedExec path) are cached on first access.
-        // cache.put() always routes to data Foyer — metadata Foyer is only
-        // populated via explicit put_metadata() from warmup.
+        // (3) Existing direct remote/local fetch path (streaming). Serves head
+        // fall-through, non-range reads, unresolvable ranges, and oversized
+        // resolvable ranges. Preserves remote-first routing and the
+        // local-NotFound→remote retry. No cache write happens on this path.
         let get_result = if let Some((rp, store)) = self.resolve_remote(path_str) {
             native_bridge_common::log_debug!(
                 "TieredObjectStore: get_opts REMOTE path='{}'",
@@ -672,49 +832,6 @@ impl ObjectStore for TieredObjectStore {
                 }
             }
         }?;
-
-        // Populate data Foyer for bounded-range reads so repeated single-range
-        // reads (IndexedExec column chunks) hit cache on subsequent queries.
-        // TieredBlockCache::put() enforces max_data_entry_size — entries exceeding
-        // that limit are silently skipped (no buffering needed for them either).
-        if let Some(ref cache) = self.cache {
-            if let Some(ref get_range) = options.range {
-                if let Some((start, end)) = self.resolve_range(path_str, get_range) {
-                    let range_size = end - start;
-                    // Skip buffering for large ranges — TieredBlockCache::put() would
-                    // reject them anyway (max_data_entry_size). This avoids allocating
-                    // memory for entries that won't be cached.
-                    let max_size = cache.as_any()
-                        .downcast_ref::<opensearch_block_cache::tiered_block_cache::TieredBlockCache>()
-                        .map(|t| t.max_data_entry_size())
-                        .unwrap_or(32 * 1024 * 1024); // fallback for non-tiered cache
-                    if range_size > max_size {
-                        return Ok(get_result);
-                    }
-                    let bytes = get_result.bytes().await?;
-                    let key = range_cache_key(path_str, start, end);
-                    cache.put(&key, bytes.clone());
-                    let file_size = self.registry.get(path_str)
-                        .map(|g| g.size())
-                        .unwrap_or(end);
-                    let meta = ObjectMeta {
-                        location: location.clone(),
-                        last_modified: chrono::DateTime::<chrono::Utc>::default(),
-                        size: file_size,
-                        e_tag: None,
-                        version: None,
-                    };
-                    return Ok(GetResult {
-                        payload: object_store::GetResultPayload::Stream(
-                            futures::stream::once(async { Ok(bytes) }).boxed(),
-                        ),
-                        meta,
-                        range: start..end,
-                        attributes: Default::default(),
-                    });
-                }
-            }
-        }
 
         Ok(get_result)
     }

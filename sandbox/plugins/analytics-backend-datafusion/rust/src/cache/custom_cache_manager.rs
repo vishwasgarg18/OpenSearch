@@ -20,7 +20,7 @@ use native_bridge_common::log_debug;
 use crate::cache::{metadata_cache, page_index};
 use crate::indexed_table::parquet_bridge;
 // ─── Eager warm-tier metadata cache warmup (from tiered-block-cache work) ───
-use opensearch_tiered_storage::tiered_object_store::MetadataCachingStore;
+use opensearch_tiered_storage::tiered_object_store::{CACHE_CHUNK_SIZE, MetadataCachingStore};
 use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
 use log::{debug, error};
 
@@ -565,14 +565,31 @@ impl CustomCacheManager {
         let footer_prefetch = 64 * 1024u64; // matches DataFusion's DEFAULT_FOOTER_READ_SIZE
         let footer_start = object_meta.size.saturating_sub(footer_prefetch);
         index_ranges.push(footer_start..object_meta.size);
-        let total_pre_fetch_bytes: u64 = index_ranges.iter().map(|r| r.end - r.start).sum();
+
+        // Round each range outward to the cache's chunk boundaries so that:
+        // 1. `get_ranges` already fetches the chunk-aligned span internally for cross-boundary
+        //    reads (no extra S3 cost), and now the caller sees the full aligned bytes.
+        // 2. `put_metadata` receives chunk-aligned inputs, so every chunk is fully covered
+        //    and lands in the metadata tier under the same chunk keys queries probe with.
+        // Without this alignment, partial edge chunks of warmup ranges are skipped by
+        // `put_metadata`, leaving the metadata tier with no entry at the edges.
+        let file_size = object_meta.size;
+        let aligned_ranges: Vec<std::ops::Range<u64>> = index_ranges.iter().map(|r| {
+            let aligned_start = r.start / CACHE_CHUNK_SIZE * CACHE_CHUNK_SIZE;
+            let aligned_end = r.end
+                .div_ceil(CACHE_CHUNK_SIZE)
+                .saturating_mul(CACHE_CHUNK_SIZE)
+                .min(file_size);
+            aligned_start..aligned_end
+        }).collect();
+        let total_pre_fetch_bytes: u64 = aligned_ranges.iter().map(|r| r.end - r.start).sum();
         native_bridge_common::log_info!(
-            "[init::warmup] file='{}' index_ranges: page_index={} +1 footer (last 64KB) = {} ranges total_bytes={}",
-            file_path, pi_count, index_ranges.len(), total_pre_fetch_bytes
+            "[init::warmup] file='{}' index_ranges: page_index={} +1 footer (last 64KB) → {} chunk-aligned ranges total_bytes={}",
+            file_path, pi_count, aligned_ranges.len(), total_pre_fetch_bytes
         );
 
         // Step 4: Fetch the ranges through the store (populates data Foyer on the way).
-        let fetched_bytes = Self::fetch_ranges_via_store(store, file_path, &index_ranges, rt_handle)?;
+        let fetched_bytes = Self::fetch_ranges_via_store(store, file_path, &aligned_ranges, rt_handle)?;
         native_bridge_common::log_info!(
             "[init::warmup] file='{}' fetched n_ranges={} fetched_bytes={}",
             file_path, fetched_bytes.len(),
@@ -581,7 +598,8 @@ impl CustomCacheManager {
 
         // Step 5: Promote bytes to metadata Foyer (never-evict tier).
         // No-op when `store` is not a TieredObjectStore (default trait impl is no-op).
-        store.put_metadata(file_path, &index_ranges, &fetched_bytes);
+        // Inputs are chunk-aligned so every chunk in every range is fully covered.
+        store.put_metadata(file_path, &aligned_ranges, &fetched_bytes);
         native_bridge_common::log_info!(
             "[init::warmup] file='{}' DONE (footer + page-index promoted to metadata Foyer)",
             file_path

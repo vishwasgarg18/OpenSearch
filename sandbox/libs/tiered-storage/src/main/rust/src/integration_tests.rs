@@ -469,7 +469,8 @@ fn concurrent_metadata_reads_are_safe() {
 }
 
 /// A range read via get_range (single) and get_ranges (multi with one element)
-/// must NOT create duplicate cache entries — verify they use compatible paths.
+/// must NOT create duplicate cache entries — both go through chunk-aligned
+/// probe + populate so they share the same chunk-aligned cache key.
 #[test]
 fn get_range_and_get_ranges_share_same_cache_key() {
     let parquet_dir = TempDir::new().unwrap();
@@ -482,24 +483,22 @@ fn get_range_and_get_ranges_share_same_cache_key() {
     let path = Path::from("keyshare.parquet");
 
     block_on(async {
-        // Read first 4KB via get_ranges (data path → data_cache)
+        // Read first 4KB via get_ranges → chunk-aligned key (whole file fits in chunk 0).
         let via_ranges = store.get_ranges(&path, &[0u64..4096]).await.unwrap();
 
-        // Read same range via get_range (metadata path → metadata_cache)
+        // Read same range via get_range → same chunk-aligned key, should hit cache.
         let via_range = store.get_range(&path, 0u64..4096).await.unwrap();
 
-        // Both must return same bytes
+        // Both must return same bytes.
         assert_eq!(via_ranges[0], via_range, "get_range and get_ranges must return same bytes");
 
-        // The key is the same regardless of path
-        let key = range_cache_key("keyshare.parquet", 0, 4096);
-
-        // get_ranges puts in data_cache, get_range puts in metadata_cache
-        // One or both should have it — important thing is bytes are correct
-        let in_data = cache.data_cache().get(&key).await;
-        let in_meta = cache.metadata_cache().get(&key).await;
+        // Both paths produce the same chunk-aligned key. For a small file
+        // (file_size < 8 MiB) the chunk is [0..file_size).
+        let chunk_aligned_key = range_cache_key("keyshare.parquet", 0, file_size);
+        let in_data = cache.data_cache().get(&chunk_aligned_key).await;
+        let in_meta = cache.metadata_cache().get(&chunk_aligned_key).await;
         assert!(in_data.is_some() || in_meta.is_some(),
-            "range must be cached in at least one tier");
+            "chunk-aligned key must be cached in at least one tier after first fetch");
     });
 }
 
@@ -747,12 +746,20 @@ fn page_index_key_alignment_warmup_matches_query_time() {
     assert!(!index_ranges.is_empty(),
         "test file must have page index data; got {} ranges", index_ranges.len());
 
-    // Warmup: read actual bytes and put into metadata Foyer via store.put_metadata()
+    // Warmup: production callers chunk-align their ranges before put_metadata so
+    // that every chunk touched is fully covered (matching what custom_cache_manager
+    // does). Mirror that here.
     let file_bytes = std::fs::read(parquet_dir.path().join("page_idx.parquet")).unwrap();
-    let range_data: Vec<bytes::Bytes> = index_ranges.iter()
+    const CHUNK: u64 = 8 << 20;
+    let aligned_ranges: Vec<std::ops::Range<u64>> = index_ranges.iter().map(|r| {
+        let aligned_start = r.start / CHUNK * CHUNK;
+        let aligned_end = r.end.div_ceil(CHUNK).saturating_mul(CHUNK).min(file_size);
+        aligned_start..aligned_end
+    }).collect();
+    let range_data: Vec<bytes::Bytes> = aligned_ranges.iter()
         .map(|r| bytes::Bytes::copy_from_slice(&file_bytes[r.start as usize..r.end as usize]))
         .collect();
-    store.put_metadata("page_idx.parquet", &index_ranges, &range_data);
+    store.put_metadata("page_idx.parquet", &aligned_ranges, &range_data);
 
     // Assert: the global page index range covers ALL individual column offsets
     let global_range = &index_ranges[0];
@@ -775,34 +782,40 @@ fn page_index_key_alignment_warmup_matches_query_time() {
         }
     }
 
-    // Assert: the exact cache key we expect is in metadata Foyer
-    let expected_key = range_cache_key("page_idx.parquet", global_range.start, global_range.end);
+    // Assert: the chunk-aligned key (which covers the global PI range) is in metadata Foyer.
+    // For a small test file (file_size < 8 MiB) this is the single chunk [0..file_size).
+    let aligned_global = &aligned_ranges[0];
+    let expected_key = range_cache_key("page_idx.parquet", aligned_global.start, aligned_global.end);
     block_on(async {
         assert!(cache.metadata_cache().get(&expected_key).await.is_some(),
-            "exact global page index key {}..{} must be in metadata Foyer",
-            global_range.start, global_range.end);
+            "chunk-aligned page index key {}..{} must be in metadata Foyer",
+            aligned_global.start, aligned_global.end);
 
-        // Assert: page index range is NOT in data Foyer (put_metadata goes only to metadata)
+        // Assert: the chunk is NOT in data Foyer (put_metadata goes only to metadata).
         assert!(cache.data_cache().get(&expected_key).await.is_none(),
-            "page index range must NOT be in data Foyer — only metadata Foyer");
+            "page index chunk must NOT be in data Foyer — only metadata Foyer");
     });
 
-    // Also warmup the footer (last 8KB)
+    // Also warmup the footer (last 8KB) — production callers chunk-align this too.
+    // For a tiny test file this resolves to the same chunk that already covers PI.
     let footer_start = file_size.saturating_sub(8 * 1024);
     warmup_metadata(&cache, parquet_dir.path(), "page_idx.parquet", footer_start, file_size);
 
-    // Delete local file — all reads must come from metadata cache
+    // Delete local file — all reads must come from metadata cache.
     std::fs::remove_file(parquet_dir.path().join("page_idx.parquet")).unwrap();
 
     block_on(async {
         // Read the global page index range via store — must succeed from metadata cache
+        // via the chunk-aligned probe (slicing the warmup-promoted chunk).
         let result = store.get_range(&path, global_range.start..global_range.end).await;
         assert!(result.is_ok(),
             "global page index range ({}..{}) must be served from metadata cache after file deletion",
             global_range.start, global_range.end);
         let bytes = result.unwrap();
-        assert_eq!(bytes, range_data[0],
-            "page index bytes must match warmup data byte-for-byte");
+        // Slice the cached chunk to compare byte-for-byte with the original file_bytes.
+        let expected = &file_bytes[global_range.start as usize..global_range.end as usize];
+        assert_eq!(bytes.as_ref(), expected,
+            "page index bytes must match the source file byte-for-byte");
     });
 }
 
@@ -1038,6 +1051,9 @@ fn page_index_ranges_match_parquet_crate_computation() {
 /// through get_opts. This must NOT put column data bytes into metadata Foyer.
 /// Only warmup's explicit put_metadata() should populate metadata Foyer.
 #[test]
+/// **Test**: get_opts on a cache miss populates ONLY the data tier (never metadata),
+/// and only when the read covers a full chunk. Warmup (put_metadata) is the only
+/// path that writes to the metadata tier.
 fn get_opts_probe_does_not_pollute_metadata_foyer() {
     let parquet_dir = TempDir::new().unwrap();
     let data_dir = TempDir::new().unwrap();
@@ -1048,37 +1064,38 @@ fn get_opts_probe_does_not_pollute_metadata_foyer() {
     let store = create_store(parquet_dir.path(), cache.clone(), "nopollute.parquet", file_size);
     let path = Path::from("nopollute.parquet");
 
-    // First, put only the footer into metadata cache via explicit warmup
-    let footer_start = file_size.saturating_sub(8 * 1024);
-    warmup_metadata(&cache, parquet_dir.path(), "nopollute.parquet", footer_start, file_size);
+    block_on(async {
+        // Cold cache. Read the whole file (chunk-aligned for files < 8 MiB).
+        let result = store.get_range(&path, 0..file_size).await;
+        assert!(result.is_ok(), "get_range must succeed");
+        let bytes = result.unwrap();
+        assert_eq!(bytes.len(), file_size as usize);
+
+        // After post-fetch populate, the chunk-aligned key must be in DATA tier only.
+        let chunk_key = range_cache_key("nopollute.parquet", 0, file_size);
+        assert!(cache.data_cache().get(&chunk_key).await.is_some(),
+            "get_opts post-fetch populate must write to data tier under chunk-aligned key");
+        assert!(cache.metadata_cache().get(&chunk_key).await.is_none(),
+            "get_opts post-fetch populate must NEVER write to metadata tier — that's reserved for warmup");
+    });
+
+    // Now exercise the warmup path on a different file: it must write to metadata tier.
+    let f2_size = write_test_parquet(parquet_dir.path(), "warmed.parquet", 3);
+    let store2 = create_store(parquet_dir.path(), cache.clone(), "warmed.parquet", f2_size);
+    let path2 = Path::from("warmed.parquet");
+    let f2_bytes = std::fs::read(parquet_dir.path().join("warmed.parquet")).unwrap();
+
+    // Chunk-aligned warmup (mirrors production custom_cache_manager).
+    store2.put_metadata("warmed.parquet", &[0..f2_size], &[bytes::Bytes::copy_from_slice(&f2_bytes)]);
 
     block_on(async {
-        // Verify footer IS in metadata cache
-        let footer_key = range_cache_key("nopollute.parquet", footer_start, file_size);
-        assert!(cache.metadata_cache().get(&footer_key).await.is_some(),
-            "footer must be in metadata cache after warmup");
+        let chunk_key = range_cache_key("warmed.parquet", 0, f2_size);
+        assert!(cache.metadata_cache().get(&chunk_key).await.is_some(),
+            "warmup put_metadata writes to metadata tier under chunk-aligned key");
 
-        // Now read a column data range via get_range (simulates CachedMetadataReader::get_bytes)
-        // This goes through get_opts path
-        let data_start = 0u64;
-        let data_end = 4096u64;
-        let result = store.get_range(&path, data_start..data_end).await;
-        assert!(result.is_ok(), "get_range must succeed");
-
-        // The column data range must NOT be in metadata cache
-        let data_key = range_cache_key("nopollute.parquet", data_start, data_end);
-        assert!(cache.metadata_cache().get(&data_key).await.is_none(),
-            "column data range must NOT be in metadata cache — get_opts must not auto-populate metadata");
-        assert!(cache.data_cache().get(&data_key).await.is_some(),
-            "get_opts must populate data cache on miss");
-
-        // Contrast: reading via get_ranges uses chunk-aligned key 0..file_size
-        // which already exists in metadata cache from warmup — served from there.
-        let data2 = store.get_ranges(&path, &[100u64..4196]).await.unwrap();
-        assert_eq!(data2[0].len(), 4096);
-        let data2_key = range_cache_key("nopollute.parquet", 0, file_size);
-        assert!(cache.metadata_cache().get(&data2_key).await.is_some(),
-            "chunk-aligned key must hit metadata cache (warmup cached entire file)");
+        // Subsequent sub-range read goes through chunk-aligned probe → metadata HIT.
+        let bytes = store2.get_range(&path2, 100..200).await.unwrap();
+        assert_eq!(bytes.len(), 100);
     });
 }
 
@@ -1087,18 +1104,20 @@ fn get_opts_probe_does_not_pollute_metadata_foyer() {
 /// On restart, warmup re-runs. Previously warmed metadata (footer + page indexes)
 /// should be recovered from Foyer's SSD tier, not re-fetched from local FS.
 ///
-/// Strategy: warmup puts metadata ranges into metadata Foyer, drop caches,
-/// recreate on same dirs. After recovery, verify that the majority of warmed
-/// ranges are still available from SSD. Uses the existing `metadata_survives_restart`
-/// pattern but with multiple ranges including page indexes.
+/// Strategy: warmup chunk-aligns its raw ranges (mirrors production
+/// `custom_cache_manager::warmup_file_with_store`), puts the aligned ranges into
+/// metadata Foyer, drops caches, recreates on same dirs. After recovery, verify
+/// the chunk-aligned key is still available from SSD AND that probing for any
+/// raw sub-range slices into the recovered chunk correctly.
 ///
-/// Note: Foyer's disk recovery may not recover every entry (small entries below
-/// block alignment may be lost), so we verify that at least the footer and some
-/// page index ranges survive — proving the SSD recovery path works.
+/// For a small test file (`file_size < 8 MiB`), all raw ranges chunk-align to a
+/// single key `0..file_size` so the entire file lands under one metadata-tier
+/// entry — the largest, most reliably persisted by Foyer.
 #[test]
 fn restart_no_s3_for_previously_warmed_metadata() {
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
+    use crate::tiered_object_store::CACHE_CHUNK_SIZE;
 
     let parquet_dir = TempDir::new().unwrap();
     let data_dir = TempDir::new().unwrap();
@@ -1106,42 +1125,42 @@ fn restart_no_s3_for_previously_warmed_metadata() {
 
     let file_size = write_page_indexed_parquet(parquet_dir.path(), "restart_meta.parquet", 3, 3);
 
-    // Session 1: warmup puts footer + page index ranges into metadata Foyer
-    let mut warmed_ranges: Vec<std::ops::Range<u64>> = Vec::new();
-    let mut warmed_data: Vec<bytes::Bytes> = Vec::new();
+    // Collect raw warmup ranges (footer + page index) for later sub-range probe.
+    let mut raw_ranges: Vec<std::ops::Range<u64>> = Vec::new();
+    let file_bytes = std::fs::read(parquet_dir.path().join("restart_meta.parquet")).unwrap();
     {
-        let cache = create_tiered_cache(data_dir.path(), meta_dir.path());
-        let store = create_store(parquet_dir.path(), cache.clone(), "restart_meta.parquet", file_size);
-
-        // Read file and compute page index ranges
         let file = std::fs::File::open(parquet_dir.path().join("restart_meta.parquet")).unwrap();
         let reader = SerializedFileReader::new(file).unwrap();
         let parquet_metadata = reader.metadata();
-        let file_bytes = std::fs::read(parquet_dir.path().join("restart_meta.parquet")).unwrap();
-
-        // Footer range (last 8KB — large enough to survive Foyer block alignment)
         let footer_start = file_size.saturating_sub(8 * 1024);
-        warmed_ranges.push(footer_start..file_size);
-        warmed_data.push(bytes::Bytes::copy_from_slice(&file_bytes[footer_start as usize..file_size as usize]));
-
-        // Page index ranges
+        raw_ranges.push(footer_start..file_size);
         for rg in parquet_metadata.row_groups() {
             let (col_idx_range, off_idx_range) = compute_per_rg_page_index_ranges(rg);
-            if let Some(r) = col_idx_range {
-                warmed_data.push(bytes::Bytes::copy_from_slice(&file_bytes[r.start as usize..r.end as usize]));
-                warmed_ranges.push(r);
-            }
-            if let Some(r) = off_idx_range {
-                warmed_data.push(bytes::Bytes::copy_from_slice(&file_bytes[r.start as usize..r.end as usize]));
-                warmed_ranges.push(r);
-            }
+            if let Some(r) = col_idx_range { raw_ranges.push(r); }
+            if let Some(r) = off_idx_range { raw_ranges.push(r); }
         }
+        assert!(raw_ranges.len() >= 2, "must have footer + at least 1 page index range");
+    }
 
-        assert!(warmed_ranges.len() >= 2,
-            "must have footer + at least 1 page index range");
+    // Chunk-align each raw range outward (production warmup pattern). For a small
+    // test file all entries collapse to the single chunk `0..file_size`.
+    let mut aligned_ranges: Vec<std::ops::Range<u64>> = raw_ranges.iter().map(|r| {
+        let s = r.start / CACHE_CHUNK_SIZE * CACHE_CHUNK_SIZE;
+        let e = r.end.div_ceil(CACHE_CHUNK_SIZE).saturating_mul(CACHE_CHUNK_SIZE).min(file_size);
+        s..e
+    }).collect();
+    aligned_ranges.sort_by_key(|r| (r.start, r.end));
+    aligned_ranges.dedup();
 
-        // Put all ranges into metadata Foyer
-        store.put_metadata("restart_meta.parquet", &warmed_ranges, &warmed_data);
+    let aligned_data: Vec<bytes::Bytes> = aligned_ranges.iter()
+        .map(|r| bytes::Bytes::copy_from_slice(&file_bytes[r.start as usize..r.end as usize]))
+        .collect();
+
+    // Session 1: warmup puts chunk-aligned ranges into metadata Foyer
+    {
+        let cache = create_tiered_cache(data_dir.path(), meta_dir.path());
+        let store = create_store(parquet_dir.path(), cache.clone(), "restart_meta.parquet", file_size);
+        store.put_metadata("restart_meta.parquet", &aligned_ranges, &aligned_data);
     }
     // Session 1 dropped — Foyer flushes to SSD
 
@@ -1154,7 +1173,7 @@ fn restart_no_s3_for_previously_warmed_metadata() {
 
         block_on(async {
             let mut recovered_count = 0;
-            for (i, (range, expected)) in warmed_ranges.iter().zip(warmed_data.iter()).enumerate() {
+            for (i, (range, expected)) in aligned_ranges.iter().zip(aligned_data.iter()).enumerate() {
                 let key = range_cache_key("restart_meta.parquet", range.start, range.end);
                 if let Some(cached) = cache.metadata_cache().get(&key).await {
                     assert_eq!(&cached, expected,
@@ -1164,19 +1183,32 @@ fn restart_no_s3_for_previously_warmed_metadata() {
                 }
             }
 
-            // The footer (range 0) must survive — it is the largest entry and most
-            // critical for restart without S3 calls.
-            let footer_key = range_cache_key("restart_meta.parquet",
-                warmed_ranges[0].start, warmed_ranges[0].end);
-            assert!(cache.metadata_cache().get(&footer_key).await.is_some(),
-                "footer must survive SSD recovery — this is the primary restart-without-S3 guarantee");
+            // The first chunk-aligned key (covers the file for small files; covers
+            // the footer's chunk for large files) must survive — it is the largest
+            // entry and most critical for restart without S3 calls.
+            let primary_key = range_cache_key("restart_meta.parquet",
+                aligned_ranges[0].start, aligned_ranges[0].end);
+            assert!(cache.metadata_cache().get(&primary_key).await.is_some(),
+                "primary chunk-aligned key must survive SSD recovery — this is the primary restart-without-S3 guarantee");
 
-            // At least the footer should be recovered; page index ranges may or may not
-            // depending on Foyer's block packing. The key correctness guarantee is that
-            // recovered data is byte-for-byte correct (verified above).
+            // At least one chunk-aligned entry must be recovered. Recovered data is
+            // byte-for-byte correct (verified in the loop above).
             assert!(recovered_count >= 1,
-                "at least the footer must survive SSD recovery (recovered {} of {} ranges)",
-                recovered_count, warmed_ranges.len());
+                "at least the primary chunk-aligned range must survive SSD recovery (recovered {} of {} ranges)",
+                recovered_count, aligned_ranges.len());
+
+            // Sub-range probe slices into the recovered chunk: pick the original
+            // raw footer range (sub-chunk for small files) and confirm it's still
+            // available via the chunk-aligned probe path.
+            let raw_footer = &raw_ranges[0];
+            let store2 = create_store(parquet_dir.path(), cache.clone(),
+                "restart_meta.parquet", file_size);
+            let probed = store2.get_range(
+                &Path::from("restart_meta.parquet"),
+                raw_footer.start..raw_footer.end,
+            ).await.expect("sub-range probe must slice into recovered chunk");
+            assert_eq!(probed.len() as u64, raw_footer.end - raw_footer.start,
+                "sub-range slice length must equal raw footer length");
         });
     }
 }
@@ -1456,9 +1488,15 @@ fn data_cache_lru_evicts_oldest_metadata_unaffected() {
     });
 }
 
-/// get_opts auto-populates data Foyer on miss — repeated single-range reads
-/// hit data cache on second access (simulates CachedMetadataReader::get_bytes
-/// for column chunks in IndexedExec path).
+/// `get_opts` auto-populates data Foyer on miss using a chunk-aligned write.
+///
+/// Repeated reads on the same chunk hit data cache after the first miss
+/// (simulates `CachedMetadataReader::get_bytes` for column chunks in the
+/// IndexedExec path).
+///
+/// For small files (`file_size < 8 MiB`) the chunk-aligned key is `0..file_size`,
+/// so a request for the entire file populates the chunk and any subsequent
+/// sub-range read slices into that single cached entry.
 #[test]
 fn get_opts_populates_data_cache_on_miss() {
     let parquet_dir = TempDir::new().unwrap();
@@ -1471,33 +1509,39 @@ fn get_opts_populates_data_cache_on_miss() {
     let path = Path::from("indexed.parquet");
 
     block_on(async {
-        let range = 0u64..4096;
+        // First read covers the entire file (chunk-aligned for `file_size < 8 MiB`).
+        let bytes1 = store.get_range(&path, 0..file_size).await.unwrap();
+        assert_eq!(bytes1.len() as u64, file_size);
 
-        // First read: cache miss → local FS → populate data Foyer
-        let bytes1 = store.get_range(&path, range.clone()).await.unwrap();
-        assert_eq!(bytes1.len(), 4096);
-
-        // Verify: entry is now in data Foyer (not metadata Foyer)
-        let key = range_cache_key("indexed.parquet", 0, 4096);
-        assert!(cache.data_cache().get(&key).await.is_some(),
-            "first read must populate data Foyer");
-        assert!(cache.metadata_cache().get(&key).await.is_none(),
+        // Verify the chunk-aligned key is in data Foyer (NOT metadata Foyer —
+        // post-fetch populate must never touch the warmup-only metadata tier).
+        let chunk_key = range_cache_key("indexed.parquet", 0, file_size);
+        assert!(cache.data_cache().get(&chunk_key).await.is_some(),
+            "first read must populate data Foyer under chunk-aligned key 0..{}", file_size);
+        assert!(cache.metadata_cache().get(&chunk_key).await.is_none(),
             "get_opts must NOT populate metadata Foyer");
 
-        // Second read: hits data Foyer (no local FS needed)
-        // Delete file to prove it comes from cache
+        // Delete file. Second read must come from data Foyer via chunk-aligned probe.
         std::fs::remove_file(parquet_dir.path().join("indexed.parquet")).unwrap();
 
-        let bytes2 = store.get_range(&path, range).await.unwrap();
+        let bytes2 = store.get_range(&path, 0..file_size).await.unwrap();
         assert_eq!(bytes2, bytes1,
-            "second read must return same bytes from data Foyer cache");
+            "second read (file deleted) must return same bytes from data Foyer cache");
+
+        // Sub-range read also hits the cached chunk via probe slicing.
+        let sub_end = 100u64.min(file_size);
+        let sub = store.get_range(&path, 0..sub_end).await.unwrap();
+        assert_eq!(sub.len() as u64, sub_end);
+        assert_eq!(&sub[..], &bytes1[..sub_end as usize]);
     });
 }
 
-#[test]
-
-/// get_opts skips caching for ranges exceeding max_cache_entry_size.
+/// `get_opts` skips caching for ranges exceeding `max_data_entry_size`.
 /// The threshold is configurable and dynamically updatable.
+///
+/// Uses chunk-aligned reads (`0..file_size`) since sub-chunk reads no longer
+/// auto-populate (chunk-aligned writes only persist fully-covered chunks).
+/// For a small file the chunk-aligned range covers the entire file.
 #[test]
 fn get_opts_skips_caching_for_large_ranges() {
     let parquet_dir = TempDir::new().unwrap();
@@ -1509,31 +1553,579 @@ fn get_opts_skips_caching_for_large_ranges() {
     let store = create_store(parquet_dir.path(), cache.clone(), "threshold.parquet", file_size);
     let path = Path::from("threshold.parquet");
 
-    // Set threshold to 2KB — anything larger skips caching
-    cache.update_max_data_entry_size(2048);
+    let chunk_key = range_cache_key("threshold.parquet", 0, file_size);
 
     block_on(async {
-        // Read 4KB range (> 2KB threshold) — should NOT be cached
-        let large_range = 0u64..4096.min(file_size);
-        let bytes = store.get_range(&path, large_range.clone()).await.unwrap();
-        assert!(!bytes.is_empty());
+        // Step 1: threshold below file_size → chunk-aligned read must NOT populate.
+        cache.update_max_data_entry_size(64);
+        assert!(file_size > 64, "test file must exceed the low threshold to be meaningful");
 
-        let large_key = range_cache_key("threshold.parquet", large_range.start, large_range.end);
-        assert!(cache.data_cache().get(&large_key).await.is_none(),
-            "range > threshold must NOT be cached");
+        let bytes = store.get_range(&path, 0..file_size).await.unwrap();
+        assert_eq!(bytes.len() as u64, file_size,
+            "read must succeed regardless of caching policy");
+        assert!(cache.data_cache().get(&chunk_key).await.is_none(),
+            "chunk > threshold must NOT be cached");
 
-        // Read 1KB range (< 2KB threshold) — should be cached
-        let small_range = 0u64..1024.min(file_size);
-        let _ = store.get_range(&path, small_range.clone()).await.unwrap();
+        // Step 2: bump threshold above file_size → chunk-aligned read populates.
+        cache.update_max_data_entry_size(8 * 1024 * 1024); // 8 MiB ceiling
+        let _ = store.get_range(&path, 0..file_size).await.unwrap();
+        assert!(cache.data_cache().get(&chunk_key).await.is_some(),
+            "after threshold raise to 8 MiB, chunk must be cached under chunk-aligned key");
+    });
+}
 
-        let small_key = range_cache_key("threshold.parquet", small_range.start, small_range.end);
-        assert!(cache.data_cache().get(&small_key).await.is_some(),
-            "range < threshold must be cached");
+// ───────────────────────────────────────────────────────────────────────────
+// New integration tests for chunk-aligned cache behaviour
+// ───────────────────────────────────────────────────────────────────────────
 
-        // Dynamic update: increase threshold to 8KB — now 4KB is cached
-        cache.update_max_data_entry_size(8192);
-        let _ = store.get_range(&path, large_range.clone()).await.unwrap();
-        assert!(cache.data_cache().get(&large_key).await.is_some(),
-            "after threshold increase, 4KB range must be cached");
+/// Helper: build a `ChunkFile` of the requested byte size on local FS, stuffed
+/// with a deterministic byte pattern so we can verify slicing later.
+fn write_synthetic_file(dir: &std::path::Path, name: &str, size_bytes: usize) -> u64 {
+    let path = dir.join(name);
+    // Deterministic pattern: byte i = (i * 31) as u8.
+    let buf: Vec<u8> = (0..size_bytes).map(|i| (i.wrapping_mul(31)) as u8).collect();
+    std::fs::write(&path, &buf).unwrap();
+    std::fs::metadata(&path).unwrap().len()
+}
+
+/// **Bug-hunt**: a query for a sub-range that crosses two cache chunks must
+/// (1) succeed end-to-end, (2) cache **per-chunk** entries (not one big exact-key
+/// entry), and (3) let a follow-up sub-range read on either chunk hit cache.
+///
+/// File size: 12 MiB → spans chunks `[0..8 MiB)` and `[8 MiB..12 MiB)`.
+/// Cross-boundary read: `[7 MiB..9 MiB)` — straddles both chunks.
+#[test]
+fn cross_boundary_read_caches_each_chunk_separately() {
+    use crate::tiered_object_store::CACHE_CHUNK_SIZE;
+
+    let parquet_dir = TempDir::new().unwrap();
+    let data_dir = TempDir::new().unwrap();
+    let meta_dir = TempDir::new().unwrap();
+
+    let twelve_mib: usize = 12 * 1024 * 1024;
+    let file_size = write_synthetic_file(parquet_dir.path(), "cross.bin", twelve_mib);
+    assert_eq!(file_size, twelve_mib as u64);
+
+    let cache = create_tiered_cache(data_dir.path(), meta_dir.path());
+    let store = create_store(parquet_dir.path(), cache.clone(), "cross.bin", file_size);
+    let path = Path::from("cross.bin");
+
+    // Allow the cross-boundary span to be cached (default ceiling is plenty,
+    // but explicit setting guards against environmental defaults shifting).
+    cache.update_max_data_entry_size(32 * 1024 * 1024);
+
+    block_on(async {
+        let cross_start = 7 * 1024 * 1024u64;
+        let cross_end = 9 * 1024 * 1024u64;
+
+        // First read crosses chunks 0 and 1.
+        let bytes = store.get_range(&path, cross_start..cross_end).await.unwrap();
+        assert_eq!(bytes.len() as u64, cross_end - cross_start);
+
+        // Cache must hold TWO chunk-aligned entries (not one exact-key entry).
+        let chunk0 = range_cache_key("cross.bin", 0, CACHE_CHUNK_SIZE);
+        let chunk1 = range_cache_key("cross.bin", CACHE_CHUNK_SIZE, file_size);
+        assert!(cache.data_cache().get(&chunk0).await.is_some(),
+            "chunk 0 (0..8 MiB) must be cached after cross-boundary read");
+        assert!(cache.data_cache().get(&chunk1).await.is_some(),
+            "chunk 1 (8 MiB..12 MiB) must be cached after cross-boundary read");
+
+        // Exact-key entry for the original cross-boundary span must NOT exist —
+        // we cache per-chunk, never per-request.
+        let exact = range_cache_key("cross.bin", cross_start, cross_end);
+        assert!(cache.data_cache().get(&exact).await.is_none(),
+            "exact-key entry for the unaligned span must NOT exist");
+
+        // Delete the file. Sub-range reads inside each chunk must still succeed.
+        std::fs::remove_file(parquet_dir.path().join("cross.bin")).unwrap();
+
+        // Sub-range inside chunk 0.
+        let sub0 = store.get_range(&path, 1024..2048).await.unwrap();
+        assert_eq!(sub0.len(), 1024);
+        let expected_sub0: Vec<u8> = (1024usize..2048).map(|i| (i.wrapping_mul(31)) as u8).collect();
+        assert_eq!(&sub0[..], &expected_sub0[..]);
+
+        // Sub-range inside chunk 1.
+        let sub1_start = 10 * 1024 * 1024u64;
+        let sub1_end = sub1_start + 4096;
+        let sub1 = store.get_range(&path, sub1_start..sub1_end).await.unwrap();
+        assert_eq!(sub1.len(), 4096);
+        let expected_sub1: Vec<u8> = (sub1_start as usize..sub1_end as usize)
+            .map(|i| (i.wrapping_mul(31)) as u8).collect();
+        assert_eq!(&sub1[..], &expected_sub1[..]);
+    });
+}
+
+/// **Bug-hunt**: warmup for a multi-chunk file (>8 MiB) chunk-aligns ranges and
+/// writes ALL chunks to the metadata tier. After dropping the file, queries for
+/// any sub-range succeed via the chunk-aligned probe slicing the cached chunk.
+///
+/// Mirrors `custom_cache_manager::warmup_file_with_store` for a realistic-sized
+/// file that exercises the multi-chunk write path inside `put_metadata`.
+#[test]
+fn warmup_multi_chunk_file_serves_subranges_after_file_deleted() {
+    use crate::tiered_object_store::CACHE_CHUNK_SIZE;
+
+    let parquet_dir = TempDir::new().unwrap();
+    let data_dir = TempDir::new().unwrap();
+    let meta_dir = TempDir::new().unwrap();
+
+    // 18 MiB → chunks: [0, 8M), [8M, 16M), [16M, 18M).
+    let total: usize = 18 * 1024 * 1024;
+    let file_size = write_synthetic_file(parquet_dir.path(), "warm_multi.bin", total);
+    let file_bytes = std::fs::read(parquet_dir.path().join("warm_multi.bin")).unwrap();
+
+    // The shared 8 MiB cache cannot hold an 18 MiB file's three chunks, so build
+    // tiers large enough to retain all chunks for this multi-chunk assertion.
+    // The full chunks are exactly 8 MiB (= CACHE_CHUNK_SIZE). Foyer's disk engine
+    // stores each entry within a block/region, so the block size must be >= the
+    // largest entry — with a 1 MiB block an 8 MiB entry is silently dropped on
+    // flush. Use a 16 MiB block and a 32 MiB write buffer so each 8 MiB chunk
+    // persists and is retrievable.
+    let big: usize = 64 * 1024 * 1024;
+    let big_block: usize = 16 * 1024 * 1024;
+    let big_buffer: usize = 32 * 1024 * 1024;
+    let data_cache = Arc::new(FoyerCache::new(
+        big, data_dir.path(), big_block, big_buffer, big_buffer,
+        "auto", 0, 0.0, 0, false,
+    ));
+    let metadata_cache = Arc::new(FoyerCache::new(
+        big, meta_dir.path(), big_block, big_buffer, big_buffer,
+        "auto", 0, 0.0, 0, false,
+    ));
+    let cache = Arc::new(TieredBlockCache::new(data_cache, metadata_cache));
+    let store = create_store(parquet_dir.path(), cache.clone(), "warm_multi.bin", file_size);
+    let path = Path::from("warm_multi.bin");
+
+    // Warmup: chunk-align the full-file range (production warmup pattern).
+    let raw_range = 0..file_size;
+    let aligned_start = raw_range.start / CACHE_CHUNK_SIZE * CACHE_CHUNK_SIZE;
+    let aligned_end = raw_range.end.div_ceil(CACHE_CHUNK_SIZE).saturating_mul(CACHE_CHUNK_SIZE).min(file_size);
+    store.put_metadata("warm_multi.bin",
+        &[aligned_start..aligned_end],
+        &[bytes::Bytes::copy_from_slice(&file_bytes[aligned_start as usize..aligned_end as usize])]);
+
+    block_on(async {
+        // put_metadata writes are admitted to the in-memory layer and flushed to
+        // SSD by a background flusher. Writing 18 MiB across three chunks can push
+        // entries out of memory before the disk write completes, so a get() issued
+        // immediately after put can race the flush. Wait for the flush to settle
+        // before asserting durable presence.
+        cache.wait_for_flush().await;
+
+        // All three chunks must be in the metadata tier under chunk-aligned keys.
+        let chunk0 = range_cache_key("warm_multi.bin", 0, CACHE_CHUNK_SIZE);
+        let chunk1 = range_cache_key("warm_multi.bin", CACHE_CHUNK_SIZE, 2 * CACHE_CHUNK_SIZE);
+        let chunk2 = range_cache_key("warm_multi.bin", 2 * CACHE_CHUNK_SIZE, file_size);
+        assert!(cache.metadata_cache().get(&chunk0).await.is_some(), "chunk 0 must be in metadata tier");
+        assert!(cache.metadata_cache().get(&chunk1).await.is_some(), "chunk 1 must be in metadata tier");
+        assert!(cache.metadata_cache().get(&chunk2).await.is_some(), "chunk 2 (partial last) must be in metadata tier");
+
+        // Delete file. Every sub-range read must succeed from the metadata cache.
+        std::fs::remove_file(parquet_dir.path().join("warm_multi.bin")).unwrap();
+
+        // Sub-range inside chunk 0.
+        let r0 = 100u64..200;
+        let b0 = store.get_range(&path, r0.clone()).await.unwrap();
+        assert_eq!(b0.len(), 100);
+        assert_eq!(&b0[..], &file_bytes[r0.start as usize..r0.end as usize]);
+
+        // Sub-range inside chunk 1.
+        let r1 = (CACHE_CHUNK_SIZE + 4096)..(CACHE_CHUNK_SIZE + 8192);
+        let b1 = store.get_range(&path, r1.clone()).await.unwrap();
+        assert_eq!(b1.len(), 4096);
+        assert_eq!(&b1[..], &file_bytes[r1.start as usize..r1.end as usize]);
+
+        // Sub-range inside the partial last chunk.
+        let r2 = (2 * CACHE_CHUNK_SIZE + 1024)..(2 * CACHE_CHUNK_SIZE + 2048);
+        let b2 = store.get_range(&path, r2.clone()).await.unwrap();
+        assert_eq!(b2.len(), 1024);
+        assert_eq!(&b2[..], &file_bytes[r2.start as usize..r2.end as usize]);
+    });
+}
+
+/// **Bug-hunt**: when query-time `get_ranges` issues two adjacent ranges that
+/// land in the SAME chunk, the chunk is fetched ONCE and cached ONCE — both
+/// slots reassemble from the single entry. Validates the dedup logic in
+/// `probe_cache` for a realistic multi-range request shape.
+#[test]
+fn get_ranges_two_same_chunk_subranges_dedup_to_one_chunk_entry() {
+    use crate::tiered_object_store::CACHE_CHUNK_SIZE;
+
+    let parquet_dir = TempDir::new().unwrap();
+    let data_dir = TempDir::new().unwrap();
+    let meta_dir = TempDir::new().unwrap();
+
+    let ten_mib = 10 * 1024 * 1024usize;
+    let file_size = write_synthetic_file(parquet_dir.path(), "dedup.bin", ten_mib);
+    let cache = create_tiered_cache(data_dir.path(), meta_dir.path());
+    let store = create_store(parquet_dir.path(), cache.clone(), "dedup.bin", file_size);
+    let path = Path::from("dedup.bin");
+
+    cache.update_max_data_entry_size(32 * 1024 * 1024);
+
+    block_on(async {
+        // Two non-overlapping sub-ranges, both inside chunk 0.
+        let r1 = 100u64..1100;       // 1 KiB inside chunk 0
+        let r2 = 1_000_000u64..1_001_000; // 1 KiB inside chunk 0, far from r1
+
+        let bytes_vec = store.get_ranges(&path, &[r1.clone(), r2.clone()]).await.unwrap();
+        assert_eq!(bytes_vec.len(), 2);
+        assert_eq!(bytes_vec[0].len(), 1000);
+        assert_eq!(bytes_vec[1].len(), 1000);
+
+        // Exactly one chunk-aligned entry exists — chunk 0.
+        let chunk0 = range_cache_key("dedup.bin", 0, CACHE_CHUNK_SIZE);
+        assert!(cache.data_cache().get(&chunk0).await.is_some(),
+            "chunk 0 must be cached after multi-range request");
+
+        // Second request for a third sub-range in the same chunk hits cache.
+        std::fs::remove_file(parquet_dir.path().join("dedup.bin")).unwrap();
+        let r3 = 5000u64..6000;
+        let b3 = store.get_range(&path, r3).await.unwrap();
+        assert_eq!(b3.len(), 1000, "third sub-range must hit cached chunk after file deletion");
+    });
+}
+
+/// **Bug-hunt**: a `get_opts` request whose chunk-aligned span exceeds
+/// `max_data_entry_size` must NOT populate the cache, but MUST still return
+/// the requested bytes correctly. Tests the early-return path in `get_opts`
+/// that avoids buffering a too-large response.
+#[test]
+fn get_opts_oversized_chunk_returns_bytes_but_skips_cache() {
+    let parquet_dir = TempDir::new().unwrap();
+    let data_dir = TempDir::new().unwrap();
+    let meta_dir = TempDir::new().unwrap();
+
+    let ten_mib = 10 * 1024 * 1024usize;
+    let file_size = write_synthetic_file(parquet_dir.path(), "oversize.bin", ten_mib);
+    let cache = create_tiered_cache(data_dir.path(), meta_dir.path());
+    let store = create_store(parquet_dir.path(), cache.clone(), "oversize.bin", file_size);
+    let path = Path::from("oversize.bin");
+
+    // Set ceiling well below the chunk-aligned read size.
+    cache.update_max_data_entry_size(64 * 1024); // 64 KiB
+
+    block_on(async {
+        // Read the whole file (chunk-aligned). 10 MiB > 64 KiB ceiling.
+        let bytes = store.get_range(&path, 0..file_size).await.unwrap();
+        assert_eq!(bytes.len() as u64, file_size, "read must succeed despite size cap");
+
+        // No chunk entries should have been written.
+        use crate::tiered_object_store::CACHE_CHUNK_SIZE;
+        let chunk0 = range_cache_key("oversize.bin", 0, CACHE_CHUNK_SIZE);
+        let chunk1 = range_cache_key("oversize.bin", CACHE_CHUNK_SIZE, file_size);
+        assert!(cache.data_cache().get(&chunk0).await.is_none(),
+            "chunk 0 must NOT be cached when range exceeds ceiling");
+        assert!(cache.data_cache().get(&chunk1).await.is_none(),
+            "chunk 1 must NOT be cached when range exceeds ceiling");
+    });
+}
+
+/// **Bug-hunt regression**: an unaligned `put_metadata` input with sub-chunk
+/// edges (e.g., a raw page-index range that doesn't start/end on a chunk
+/// boundary) must NOT crash AND must skip the partial edge chunks. This is
+/// the safety net for any future caller that forgets to chunk-align before
+/// calling `put_metadata`.
+///
+/// File size: 16 MiB exactly (chunks `[0, 8M)` and `[8M, 16M)`).
+/// Input range: `[1 MiB, 9 MiB)` — both edges are partial; no chunk fully covered.
+#[test]
+fn put_metadata_unaligned_edges_writes_no_chunks_does_not_panic() {
+    use crate::tiered_object_store::CACHE_CHUNK_SIZE;
+
+    let parquet_dir = TempDir::new().unwrap();
+    let data_dir = TempDir::new().unwrap();
+    let meta_dir = TempDir::new().unwrap();
+
+    let sixteen_mib = 16 * 1024 * 1024usize;
+    let file_size = write_synthetic_file(parquet_dir.path(), "unaligned.bin", sixteen_mib);
+    let file_bytes = std::fs::read(parquet_dir.path().join("unaligned.bin")).unwrap();
+    let cache = create_tiered_cache(data_dir.path(), meta_dir.path());
+    let store = create_store(parquet_dir.path(), cache.clone(), "unaligned.bin", file_size);
+
+    // Both edges partial — first chunk is partial-end (1 MiB..8 MiB),
+    // second chunk is partial-start (8 MiB..9 MiB).
+    let one_mib = 1024 * 1024u64;
+    let nine_mib = 9 * 1024 * 1024u64;
+    let r = one_mib..nine_mib;
+    let data = bytes::Bytes::copy_from_slice(&file_bytes[r.start as usize..r.end as usize]);
+
+    // Should not panic.
+    store.put_metadata("unaligned.bin", &[r], &[data]);
+
+    block_on(async {
+        // Neither chunk should be cached because both are only partially covered.
+        let chunk0 = range_cache_key("unaligned.bin", 0, CACHE_CHUNK_SIZE);
+        let chunk1 = range_cache_key("unaligned.bin", CACHE_CHUNK_SIZE, file_size);
+        assert!(cache.metadata_cache().get(&chunk0).await.is_none(),
+            "partial-end chunk 0 must be skipped");
+        assert!(cache.metadata_cache().get(&chunk1).await.is_none(),
+            "partial-start chunk 1 must be skipped");
+
+        // The unaligned exact-key must also not exist (we never write exact keys
+        // when file_size is known).
+        let exact = range_cache_key("unaligned.bin", one_mib, nine_mib);
+        assert!(cache.metadata_cache().get(&exact).await.is_none(),
+            "no exact-key entry for unaligned input");
+    });
+}
+
+/// **Bug-hunt**: warmup with a chunk-aligned input writes to METADATA tier;
+/// a subsequent query-time miss writes to DATA tier. The two paths must NEVER
+/// cross-pollute even when they hit the SAME chunk-aligned key.
+#[test]
+fn warmup_writes_metadata_tier_query_writes_data_tier_same_key() {
+    let parquet_dir = TempDir::new().unwrap();
+    let data_dir = TempDir::new().unwrap();
+    let meta_dir = TempDir::new().unwrap();
+
+    let four_mib = 4 * 1024 * 1024usize; // < 8 MiB → single chunk 0..file_size
+    let file_size = write_synthetic_file(parquet_dir.path(), "tiers.bin", four_mib);
+    let file_bytes = std::fs::read(parquet_dir.path().join("tiers.bin")).unwrap();
+    let cache = create_tiered_cache(data_dir.path(), meta_dir.path());
+    let store = create_store(parquet_dir.path(), cache.clone(), "tiers.bin", file_size);
+    let path = Path::from("tiers.bin");
+
+    // Warmup → metadata tier.
+    store.put_metadata("tiers.bin",
+        &[0..file_size],
+        &[bytes::Bytes::copy_from_slice(&file_bytes)]);
+
+    let chunk_key = range_cache_key("tiers.bin", 0, file_size);
+
+    block_on(async {
+        // Metadata tier populated.
+        assert!(cache.metadata_cache().get(&chunk_key).await.is_some(),
+            "warmup must populate metadata tier");
+        // Data tier untouched.
+        assert!(cache.data_cache().get(&chunk_key).await.is_none(),
+            "warmup must NOT populate data tier");
+
+        // Query for the same chunk: served from metadata tier (no data-tier write).
+        let _ = store.get_range(&path, 0..file_size).await.unwrap();
+        assert!(cache.metadata_cache().get(&chunk_key).await.is_some(),
+            "metadata entry remains after query");
+        assert!(cache.data_cache().get(&chunk_key).await.is_none(),
+            "query path must NOT write to data tier when metadata serves the request");
+    });
+}
+
+/// **Cross-boundary `get_opts` (Req 5.1, 5.2, 5.3)**: a single ranged `get_opts`
+/// read that straddles two cache chunks must (1) return the exact requested bytes,
+/// (2) cache each fully-covered chunk independently in the DATA tier under its
+/// chunk-aligned key (never the metadata tier), and (3) let follow-up sub-range
+/// reads inside each chunk be served from cache after the local file is gone.
+///
+/// File size: 12 MiB → spans chunks `[0..8 MiB)` and `[8 MiB..12 MiB)`.
+/// Cross-boundary read: `[7 MiB..9 MiB)` — straddles both chunks. This is the
+/// `get_opts` analogue of `cross_boundary_read_caches_each_chunk_separately`
+/// (which exercises the `get_ranges` entry point).
+#[test]
+fn cross_boundary_get_opts_caches_each_chunk_separately() {
+    use crate::tiered_object_store::CACHE_CHUNK_SIZE;
+    use object_store::{GetOptions, GetRange};
+
+    let parquet_dir = TempDir::new().unwrap();
+    let data_dir = TempDir::new().unwrap();
+    let meta_dir = TempDir::new().unwrap();
+
+    let twelve_mib: usize = 12 * 1024 * 1024;
+    let file_size = write_synthetic_file(parquet_dir.path(), "cross_opts.bin", twelve_mib);
+    assert_eq!(file_size, twelve_mib as u64);
+    let file_bytes = std::fs::read(parquet_dir.path().join("cross_opts.bin")).unwrap();
+
+    let cache = create_tiered_cache(data_dir.path(), meta_dir.path());
+    let store = create_store(parquet_dir.path(), cache.clone(), "cross_opts.bin", file_size);
+    let path = Path::from("cross_opts.bin");
+
+    // Raise the per-entry ceiling above the cross-boundary span so the get_opts
+    // router does NOT hit the oversized-stream guard and routes through get_ranges.
+    cache.update_max_data_entry_size(32 * 1024 * 1024);
+
+    block_on(async {
+        let cross_start = 7 * 1024 * 1024u64;
+        let cross_end = 9 * 1024 * 1024u64;
+
+        // Cross-boundary get_opts read (straddles chunks 0 and 1).
+        let opts = GetOptions {
+            range: Some(GetRange::Bounded(cross_start..cross_end)),
+            ..Default::default()
+        };
+        let result = store.get_opts(&path, opts).await.unwrap();
+        let bytes = result.bytes().await.unwrap();
+
+        // (1) Length and content correctness.
+        assert_eq!(bytes.len() as u64, cross_end - cross_start,
+            "returned length must equal the requested span");
+        assert_eq!(&bytes[..], &file_bytes[cross_start as usize..cross_end as usize],
+            "returned bytes must be byte-for-byte identical to the file's bytes at the range");
+
+        // (2) Both fully-covered chunks must be cached in the DATA tier under
+        // their chunk-aligned keys.
+        let chunk0 = range_cache_key("cross_opts.bin", 0, CACHE_CHUNK_SIZE);
+        let chunk1 = range_cache_key("cross_opts.bin", CACHE_CHUNK_SIZE, file_size);
+        assert!(cache.data_cache().get(&chunk0).await.is_some(),
+            "chunk 0 (0..8 MiB) must be cached in DATA tier after cross-boundary get_opts");
+        assert!(cache.data_cache().get(&chunk1).await.is_some(),
+            "chunk 1 (8 MiB..12 MiB) must be cached in DATA tier after cross-boundary get_opts");
+
+        // Neither chunk may land in the metadata (never-evict) tier — the query
+        // path must never write there.
+        assert!(cache.metadata_cache().get(&chunk0).await.is_none(),
+            "chunk 0 must NOT be in metadata tier (query path is data-tier only)");
+        assert!(cache.metadata_cache().get(&chunk1).await.is_none(),
+            "chunk 1 must NOT be in metadata tier (query path is data-tier only)");
+
+        // No exact-key entry for the unaligned request span — we cache per-chunk.
+        let exact = range_cache_key("cross_opts.bin", cross_start, cross_end);
+        assert!(cache.data_cache().get(&exact).await.is_none(),
+            "exact-key entry for the unaligned span must NOT exist");
+
+        // (3) Delete the local file; sub-range get_opts reads inside each chunk
+        // must still succeed from the cached chunks.
+        std::fs::remove_file(parquet_dir.path().join("cross_opts.bin")).unwrap();
+
+        // Sub-range inside chunk 0.
+        let sub0_start = 1024u64;
+        let sub0_end = 2048u64;
+        let opts0 = GetOptions {
+            range: Some(GetRange::Bounded(sub0_start..sub0_end)),
+            ..Default::default()
+        };
+        let sub0 = store.get_opts(&path, opts0).await.unwrap().bytes().await.unwrap();
+        assert_eq!(sub0.len() as u64, sub0_end - sub0_start);
+        assert_eq!(&sub0[..], &file_bytes[sub0_start as usize..sub0_end as usize],
+            "sub-range inside chunk 0 must be served correctly from cache");
+
+        // Sub-range inside chunk 1.
+        let sub1_start = 10 * 1024 * 1024u64;
+        let sub1_end = sub1_start + 4096;
+        let opts1 = GetOptions {
+            range: Some(GetRange::Bounded(sub1_start..sub1_end)),
+            ..Default::default()
+        };
+        let sub1 = store.get_opts(&path, opts1).await.unwrap().bytes().await.unwrap();
+        assert_eq!(sub1.len() as u64, sub1_end - sub1_start);
+        assert_eq!(&sub1[..], &file_bytes[sub1_start as usize..sub1_end as usize],
+            "sub-range inside chunk 1 must be served correctly from cache");
+    });
+}
+
+/// **Task 7.1**: A sub-chunk `get_opts` cold read over real Foyer SSD tiers must
+/// populate ONLY the data tier with the chunk-aligned entry — never the
+/// never-evict metadata tier (that tier is reserved for warmup `put_metadata`).
+///
+/// A small parquet file (`file_size < 8 MiB`) is a single chunk `0..file_size`.
+/// A sub-chunk ranged read (`GetRange::Bounded(100..500)`) routes through the
+/// `get_ranges` path, which fetches and caches the full enclosing chunk
+/// `0..file_size`. We assert the chunk-aligned key
+/// `range_cache_key(name, 0, file_size)` is present in the DATA tier and absent
+/// from the METADATA tier.
+///
+/// _Requirements: 1.1, 6.1, 6.3_
+#[test]
+fn get_opts_subchunk_populates_data_tier_only() {
+    use object_store::{GetOptions, GetRange};
+
+    let parquet_dir = TempDir::new().unwrap();
+    let data_dir = TempDir::new().unwrap();
+    let meta_dir = TempDir::new().unwrap();
+
+    // Small parquet file (< 8 MiB) → single chunk 0..file_size.
+    let file_size = write_test_parquet(parquet_dir.path(), "subchunk.parquet", 3);
+    assert!(file_size < 8 * 1024 * 1024,
+        "test file must be smaller than one chunk so it collapses to a single chunk 0..file_size");
+    assert!(file_size > 500, "test file must be larger than the sub-chunk range end");
+
+    let cache = create_tiered_cache(data_dir.path(), meta_dir.path());
+    let store = create_store(parquet_dir.path(), cache.clone(), "subchunk.parquet", file_size);
+    let path = Path::from("subchunk.parquet");
+
+    block_on(async {
+        // Cold cache. Issue a SUB-CHUNK ranged get_opts read. Because the small
+        // file is one chunk, this routes through get_ranges and caches the whole
+        // file as chunk 0..file_size.
+        let opts = GetOptions {
+            range: Some(GetRange::Bounded(100..500)),
+            ..Default::default()
+        };
+        let result = store.get_opts(&path, opts).await.unwrap();
+        let bytes = result.bytes().await.unwrap();
+        assert_eq!(bytes.len(), 400, "sub-chunk read must return exactly the requested 400 bytes");
+
+        // The chunk-aligned key 0..file_size must be present in the DATA tier and
+        // ABSENT from the metadata tier (query path is data-tier only).
+        let chunk_key = range_cache_key("subchunk.parquet", 0, file_size);
+        assert!(cache.data_cache().get(&chunk_key).await.is_some(),
+            "sub-chunk get_opts cold read must populate the enclosing chunk in the DATA tier");
+        assert!(cache.metadata_cache().get(&chunk_key).await.is_none(),
+            "sub-chunk get_opts cold read must NEVER write the metadata tier — reserved for warmup");
+    });
+}
+
+/// **Task 7.2**: After a sub-chunk `get_opts` cold read caches the enclosing
+/// chunk, deleting the local backing file must not prevent a DIFFERENT sub-range
+/// read within the same chunk from succeeding — it is served entirely from the
+/// data-tier cache with no backing file access.
+///
+/// We capture the file bytes before deletion to assert byte-for-byte correctness
+/// of the second read.
+///
+/// _Requirements: 1.3_
+#[test]
+fn get_opts_second_subrange_hits_cache_after_file_delete() {
+    use object_store::{GetOptions, GetRange};
+
+    let parquet_dir = TempDir::new().unwrap();
+    let data_dir = TempDir::new().unwrap();
+    let meta_dir = TempDir::new().unwrap();
+
+    // Small parquet file (< 8 MiB) → single chunk 0..file_size.
+    let file_size = write_test_parquet(parquet_dir.path(), "delete_hit.parquet", 3);
+    assert!(file_size < 8 * 1024 * 1024,
+        "test file must be smaller than one chunk so it collapses to a single chunk 0..file_size");
+    assert!(file_size > 1500, "test file must be larger than the second sub-range end");
+
+    // Capture the file bytes BEFORE deletion for byte-correctness checks.
+    let file_bytes = std::fs::read(parquet_dir.path().join("delete_hit.parquet")).unwrap();
+
+    let cache = create_tiered_cache(data_dir.path(), meta_dir.path());
+    let store = create_store(parquet_dir.path(), cache.clone(), "delete_hit.parquet", file_size);
+    let path = Path::from("delete_hit.parquet");
+
+    block_on(async {
+        // First sub-chunk get_opts read populates the whole chunk 0..file_size.
+        let first_start = 100u64;
+        let first_end = 500u64;
+        let opts1 = GetOptions {
+            range: Some(GetRange::Bounded(first_start..first_end)),
+            ..Default::default()
+        };
+        let first = store.get_opts(&path, opts1).await.unwrap().bytes().await.unwrap();
+        assert_eq!(&first[..], &file_bytes[first_start as usize..first_end as usize],
+            "first sub-range bytes must match the backing file");
+
+        // The enclosing chunk must now be in the data tier.
+        let chunk_key = range_cache_key("delete_hit.parquet", 0, file_size);
+        assert!(cache.data_cache().get(&chunk_key).await.is_some(),
+            "first read must populate the enclosing chunk in the data tier");
+
+        // Delete the local backing file — no backing access is possible now.
+        std::fs::remove_file(parquet_dir.path().join("delete_hit.parquet")).unwrap();
+
+        // A DIFFERENT sub-range within the same chunk must still succeed, served
+        // entirely from the data-tier cache.
+        let second_start = 1000u64;
+        let second_end = 1500u64;
+        let opts2 = GetOptions {
+            range: Some(GetRange::Bounded(second_start..second_end)),
+            ..Default::default()
+        };
+        let second = store.get_opts(&path, opts2).await.unwrap().bytes().await.unwrap();
+        assert_eq!(second.len() as u64, second_end - second_start,
+            "second sub-range must return exactly the requested bytes from cache");
+        assert_eq!(&second[..], &file_bytes[second_start as usize..second_end as usize],
+            "second sub-range (file deleted) must be served byte-for-byte from the data-tier cache");
     });
 }
